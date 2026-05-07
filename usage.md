@@ -92,551 +92,421 @@ Per-environment values override global values. For labels, global and per-env la
 
 ## Complete YAML Input Definition
 
-This section documents **every input** the YAML config file accepts, organised by section. Each field lists its type, whether it is required or optional, its default value, and a description.
+This section documents **every input** the YAML config file accepts. Each field shows whether it is `[Required]` or `[Optional]`, its default value, and a description.
 
-> **Legend**: `[R]` = Required, `[O]` = Optional. Default column shows the value used when the field is omitted entirely.
-
----
-
-### Global-Level Fields
-
-These sit at the root of the YAML file. They apply to all environments unless overridden per-environment.
-
-```yaml
-project_id: "my-gcp-project"
-region: "europe-west2"
-enable_apis: true
-apis:
-  - "bigquery.googleapis.com"
-labels:
-  managed_by: terraform
-environments:
-  # ... (see per-environment section below)
 ```
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `project_id` | `string` | **[R]** | — | GCP project ID where all resources are created. Can be overridden per-environment. |
-| `region` | `string` | [O] | `"europe-west2"` | GCP region for all environments. Can be overridden per-environment. |
-| `labels` | `map(string)` | [O] | `{}` | Labels applied to all environments. Merged with per-env labels (per-env wins on key conflicts). |
-| `enable_apis` | `bool` | [O] | `true` | Whether to auto-enable required GCP APIs (`composer`, `compute`, `iam`, `cloudresourcemanager`, `serviceusage`). Set `false` if APIs are managed externally. Can be overridden per-environment. |
-| `apis` | `list(string)` | [O] | `[]` | Additional GCP API service names to enable beyond the defaults (e.g. `bigquery.googleapis.com`). Can be overridden per-environment. |
-| `environments` | `map(object)` | **[R]** | — | Map of Composer environments to create. Each key is the default environment name; each value is the per-environment config (see below). An empty value `{}` is valid and uses all defaults. |
-
----
-
-### Per-Environment Fields
-
-All fields below go under `environments.<env-key>:`. **Every field is optional** — an empty `{}` value creates a working environment using all module defaults.
-
----
-
-#### Identity & Sizing
-
-```yaml
-environments:
-  composer-prod:
-    environment_name: "custom-name"
-    project_id: "override-project"
-    region: "us-central1"
-    environment_size: "ENVIRONMENT_SIZE_LARGE"
-    resilience_mode: "HIGH_RESILIENCE"
-    labels:
-      env: production
-```
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `environment_name` | `string` | [O] | The YAML key (e.g. `composer-prod`) | Override the Composer environment name. If omitted, the map key is used as the name. |
-| `project_id` | `string` | [O] | Inherits global `project_id` | Override the GCP project for this specific environment. |
-| `region` | `string` | [O] | Inherits global `region` → `"europe-west2"` | Override the GCP region for this environment. |
-| `environment_size` | `string` | [O] | `"ENVIRONMENT_SIZE_SMALL"` | Composer environment size tier. Controls baseline resource allocation managed by GCP. Allowed values: `ENVIRONMENT_SIZE_SMALL`, `ENVIRONMENT_SIZE_MEDIUM`, `ENVIRONMENT_SIZE_LARGE`. |
-| `resilience_mode` | `string` | [O] | Not set (standard resilience) | Set to `"HIGH_RESILIENCE"` to enable multi-zone redundancy for the scheduler, database, and web server. Allowed values: `STANDARD_RESILIENCE`, `HIGH_RESILIENCE`. |
-| `labels` | `map(string)` | [O] | `{}` | Labels for this environment. Merged with global labels — per-env labels win on key conflicts. |
-| `enable_apis` | `bool` | [O] | Inherits global `enable_apis` → `true` | Override API enablement for this environment. |
-| `apis` | `list(string)` | [O] | Inherits global `apis` → `[]` | Override additional APIs for this environment. |
-
----
-
-#### Network
-
-The entire `network` block is optional. When omitted, a dedicated VPC is created per environment with default CIDR ranges.
-
-```yaml
-    network:
-      create: true
-      name: "my-network"
-      subnetwork_name: "my-subnet"
-      subnetwork_cidr: "10.0.0.0/24"
-      pods_range_name: "pods"
-      pods_cidr: "10.1.0.0/16"
-      services_range_name: "services"
-      services_cidr: "10.2.0.0/20"
-      enable_cloud_nat: false
-      tags:
-        - "composer"
-      existing_network: null
-      existing_subnetwork: null
-```
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `network.create` | `bool` | [O] | `true` | Whether to create a new VPC network and subnet. Set `false` to use an existing network (provide `existing_network` and `existing_subnetwork`). |
-| `network.name` | `string` | [O] | `"{env-name}-network"` | Name of the VPC network to create. Only used when `create: true`. Auto-derived from the environment key. |
-| `network.subnetwork_name` | `string` | [O] | `"{env-name}-subnet"` | Name of the subnet to create. Only used when `create: true`. Auto-derived from the environment key. |
-| `network.subnetwork_cidr` | `string` | [O] | `"10.0.0.0/24"` | Primary CIDR range for the subnet. Used for Composer infrastructure nodes. |
-| `network.existing_network` | `string` | [O] | `null` | Full self-link of an existing VPC network. Required when `create: false`. Format: `projects/{project}/global/networks/{name}`. |
-| `network.existing_subnetwork` | `string` | [O] | `null` | Full self-link of an existing subnet. Required when `create: false`. Format: `projects/{project}/regions/{region}/subnetworks/{name}`. Must have secondary ranges matching `pods_range_name` and `services_range_name`. |
-| `network.pods_range_name` | `string` | [O] | `"pods"` | Name of the secondary IP range used for GKE pods. When using an existing subnet, this must match an existing secondary range name. |
-| `network.pods_cidr` | `string` | [O] | `"10.1.0.0/16"` | CIDR range for the pods secondary range. Only used when `create: true`. A `/16` provides ~65k pod IPs. |
-| `network.services_range_name` | `string` | [O] | `"services"` | Name of the secondary IP range used for GKE services. When using an existing subnet, this must match an existing secondary range name. |
-| `network.services_cidr` | `string` | [O] | `"10.2.0.0/20"` | CIDR range for the services secondary range. Only used when `create: true`. A `/20` provides ~4k service IPs. |
-| `network.enable_cloud_nat` | `bool` | [O] | `false` | Whether to create a Cloud Router and Cloud NAT gateway for outbound internet access. **Set to `true` when using private environments** so workers can reach PyPI and external services. |
-| `network.tags` | `list(string)` | [O] | `["composer"]` | Network tags applied to Composer nodes. Used as targets for the auto-created firewall rules. |
-
-**When `create: true`** (default), the module creates:
-- A VPC network with `auto_create_subnetworks = false`
-- A subnet with the specified primary and secondary ranges with `private_ip_google_access = true`
-- A firewall rule allowing internal TCP/UDP/ICMP between all CIDR ranges
-- A firewall rule allowing GCP health check source ranges (`35.191.0.0/16`, `130.211.0.0/22`)
-- (If `enable_cloud_nat: true`) A Cloud Router and Cloud NAT with auto-allocated IPs
-
----
-
-#### Service Account
-
-The entire `service_account` block is optional. When omitted, a service account is auto-created as `{env-name}-sa`.
-
-```yaml
-    service_account:
-      create: true
-      name: "my-custom-sa"
-      existing_email: null
-      roles:
-        - "roles/composer.worker"
-        - "roles/logging.logWriter"
-        - "roles/monitoring.metricWriter"
-```
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `service_account.create` | `bool` | [O] | `true` | Whether to create a new service account. Set `false` to use an existing one (provide `existing_email`). |
-| `service_account.name` | `string` | [O] | `"{env-name}-sa"` | The `account_id` for the new service account (max 30 characters, lowercase alphanumeric + hyphens). Auto-derived from the environment key. Only used when `create: true`. |
-| `service_account.existing_email` | `string` | [O] | `null` | Email address of an existing service account to use. Required when `create: false`. Format: `name@project.iam.gserviceaccount.com`. |
-| `service_account.roles` | `list(string)` | [O] | `["roles/composer.worker", "roles/logging.logWriter", "roles/monitoring.metricWriter"]` | IAM roles to grant to the service account on the project. `roles/composer.worker` is **required** for Composer to function — always include it. |
-
-**Automatic IAM bindings** (always created, not configurable):
-- `roles/composer.ServiceAgentV2Ext` → Composer service agent on the project
-- `roles/iam.serviceAccountUser` → Composer service agent on the environment's SA
-
----
-
-#### Software Configuration
-
-The entire `software_config` block is optional. When omitted, GCP selects the latest stable Composer 3 image.
-
-```yaml
-    software_config:
-      image_version: "composer-3-airflow-2.10.2"
-      airflow_config_overrides:
-        core-dags_are_paused_at_creation: "True"
-        webserver-expose_config: "False"
-      env_variables:
-        ENVIRONMENT: "production"
-      pypi_packages:
-        apache-airflow-providers-google: ">=10.0.0"
-        pandas: ">=2.0.0"
-```
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `software_config.image_version` | `string` | [O] | `null` (GCP picks latest) | Composer image version string. When omitted, GCP automatically selects the latest stable Composer 3 version. Must start with `composer-3` if provided. Run `gcloud composer environments list-image-versions --location=REGION` to list available versions. Example: `"composer-3-airflow-2.10.2"`. |
-| `software_config.airflow_config_overrides` | `map(string)` | [O] | `{}` | Airflow configuration property overrides. Keys use `section-key` format with a **hyphen** separator (not dot). Example: `core-dags_are_paused_at_creation: "True"` maps to `[core] dags_are_paused_at_creation = True` in `airflow.cfg`. All values must be strings. |
-| `software_config.env_variables` | `map(string)` | [O] | `{}` | Environment variables injected into all Airflow components (scheduler, worker, web server). Available in DAGs via `os.environ`. Do not use for secrets — use Secret Manager instead. |
-| `software_config.pypi_packages` | `map(string)` | [O] | `{}` | Additional PyPI packages to install. Keys are package names, values are version specifiers (e.g. `">=10.0.0"`, `"==2.1.0"`, `""`). Packages are installed during environment creation and updates. |
-
----
-
-#### Workloads
-
-The `workloads` block configures compute resources for each Composer component. The entire block is optional — all sub-components have defaults.
-
-**Important**: `scheduler`, `web_server`, and `worker` are always created (with defaults if not specified). `triggerer` and `dag_processor` are **only created when their block is explicitly present** in the YAML.
-
-```yaml
-    workloads:
-      scheduler:
-        cpu: 0.5
-        memory_gb: 2
-        storage_gb: 1
-        count: 1
-      web_server:
-        cpu: 1
-        memory_gb: 2
-        storage_gb: 1
-      worker:
-        cpu: 1
-        memory_gb: 2
-        storage_gb: 1
-        min_count: 1
-        max_count: 3
-      triggerer:        # OPTIONAL — omit to not create
-        cpu: 0.5
-        memory_gb: 0.5
-        count: 1
-      dag_processor:    # OPTIONAL — omit to not create
-        cpu: 1
-        memory_gb: 2
-        storage_gb: 1
-        count: 1
-```
-
-##### workloads.scheduler
-
-Parses DAGs and schedules task execution. Always created.
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `workloads.scheduler.cpu` | `number` | [O] | `0.5` | vCPUs allocated to each scheduler instance. |
-| `workloads.scheduler.memory_gb` | `number` | [O] | `2` | Memory in GB allocated to each scheduler instance. |
-| `workloads.scheduler.storage_gb` | `number` | [O] | `1` | Storage in GB allocated to each scheduler instance. |
-| `workloads.scheduler.count` | `number` | [O] | `1` | Number of scheduler instances. Set to `2` for high availability. |
-
-##### workloads.web_server
-
-Serves the Airflow UI. Always created (single instance).
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `workloads.web_server.cpu` | `number` | [O] | `1` | vCPUs allocated to the web server. |
-| `workloads.web_server.memory_gb` | `number` | [O] | `2` | Memory in GB allocated to the web server. |
-| `workloads.web_server.storage_gb` | `number` | [O] | `1` | Storage in GB allocated to the web server. |
-
-##### workloads.worker
-
-Executes Airflow tasks. Always created with autoscaling between `min_count` and `max_count`.
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `workloads.worker.cpu` | `number` | [O] | `1` | vCPUs allocated to each worker instance. |
-| `workloads.worker.memory_gb` | `number` | [O] | `2` | Memory in GB allocated to each worker instance. |
-| `workloads.worker.storage_gb` | `number` | [O] | `1` | Storage in GB allocated to each worker instance. |
-| `workloads.worker.min_count` | `number` | [O] | `1` | Minimum number of worker instances (always running). |
-| `workloads.worker.max_count` | `number` | [O] | `3` | Maximum number of worker instances (autoscale ceiling). |
-
-##### workloads.triggerer
-
-Monitors deferred tasks and resumes them when conditions are met (e.g. external sensor completion). **Only created when this block is present in the YAML.** Omit the entire `triggerer:` key to skip creation.
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `workloads.triggerer.cpu` | `number` | [O] | `0.5` | vCPUs allocated to each triggerer instance. |
-| `workloads.triggerer.memory_gb` | `number` | [O] | `0.5` | Memory in GB allocated to each triggerer instance. |
-| `workloads.triggerer.count` | `number` | [O] | `1` | Number of triggerer instances. |
-
-##### workloads.dag_processor
-
-Separate process for parsing DAG files (Composer 3 feature). **Only created when this block is present in the YAML.** Omit the entire `dag_processor:` key to skip creation.
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `workloads.dag_processor.cpu` | `number` | [O] | `1` | vCPUs allocated to each DAG processor instance. |
-| `workloads.dag_processor.memory_gb` | `number` | [O] | `2` | Memory in GB allocated to each DAG processor instance. |
-| `workloads.dag_processor.storage_gb` | `number` | [O] | `1` | Storage in GB allocated to each DAG processor instance. |
-| `workloads.dag_processor.count` | `number` | [O] | `1` | Number of DAG processor instances. |
-
----
-
-#### Private Environment
-
-The entire `private_environment` block is optional. When omitted, the Composer environment uses public IP networking. When present, it configures private networking for the environment.
-
-```yaml
-    private_environment:
-      enable_private_endpoint: false
-      cloud_sql_ipv4_cidr_block: "10.10.0.0/24"
-      web_server_ipv4_cidr_block: "10.10.1.0/24"
-      master_ipv4_cidr_block: "10.10.2.0/28"
-      cloud_composer_network_ipv4_cidr_block: "10.10.3.0/24"
-      enable_privately_used_public_ips: false
-      connection_type: "VPC_PEERING"
-```
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `private_environment.enable_private_endpoint` | `bool` | [O] | `false` | When `true`, the Airflow web server has no public IP and is only accessible via private network. Requires VPN, bastion, or IAP for access. |
-| `private_environment.cloud_sql_ipv4_cidr_block` | `string` | [O] | `null` (GCP auto-assigns) | CIDR block for the Cloud SQL instance used by the Composer environment. Must not overlap with other ranges. |
-| `private_environment.web_server_ipv4_cidr_block` | `string` | [O] | `null` (GCP auto-assigns) | CIDR block for the Airflow web server. |
-| `private_environment.master_ipv4_cidr_block` | `string` | [O] | `null` (GCP auto-assigns) | CIDR block for the GKE control plane. Must be a `/28` range. |
-| `private_environment.cloud_composer_network_ipv4_cidr_block` | `string` | [O] | `null` (GCP auto-assigns) | CIDR block for the Cloud Composer networking infrastructure. |
-| `private_environment.enable_privately_used_public_ips` | `bool` | [O] | `false` | When `true`, allows using publicly-routable IP ranges for private GKE endpoints. Useful in organisations with large private IP allocations. |
-| `private_environment.connection_type` | `string` | [O] | `"VPC_PEERING"` | Network connection type. `VPC_PEERING` creates a VPC peering connection. `PRIVATE_SERVICE_CONNECT` uses PSC (recommended for Composer 3). |
-
-> **Tip**: When `enable_private_endpoint: true`, set `network.enable_cloud_nat: true` so workers can reach PyPI and external services.
-
----
-
-#### Master Authorized Networks
-
-The entire `master_authorized_networks` block is optional. When omitted, no master authorized network restrictions are applied. When present, it restricts which IP ranges can access the GKE control plane.
-
-```yaml
-    master_authorized_networks:
-      enabled: true
-      cidr_blocks:
-        - display_name: "office-vpn"
-          cidr_block: "203.0.113.0/24"
-        - display_name: "cicd-runners"
-          cidr_block: "198.51.100.0/24"
-```
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `master_authorized_networks.enabled` | `bool` | [O] | `true` (when block is present) | Whether master authorized networks are enforced. |
-| `master_authorized_networks.cidr_blocks` | `list(object)` | [O] | `[]` | List of CIDR blocks allowed to access the GKE control plane. |
-| `master_authorized_networks.cidr_blocks[].display_name` | `string` | **[R]** (per entry) | — | Human-readable name for the CIDR block (e.g. `"office-vpn"`). |
-| `master_authorized_networks.cidr_blocks[].cidr_block` | `string` | **[R]** (per entry) | — | IP range in CIDR notation (e.g. `"10.0.0.0/8"`). |
-
----
-
-#### Maintenance Window
-
-The entire `maintenance_window` block is optional. When omitted, GCP schedules maintenance at any time. When present, it restricts Composer maintenance operations (upgrades, patches) to the specified recurring window.
-
-```yaml
-    maintenance_window:
-      start_time: "2024-01-01T02:00:00Z"
-      end_time: "2024-01-01T06:00:00Z"
-      recurrence: "FREQ=WEEKLY;BYDAY=SU"
-```
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `maintenance_window.start_time` | `string` | **[R]** (when block present) | — | Start time in RFC 3339 format. Only the time-of-day portion matters; the date is used as an anchor. Example: `"2024-01-01T02:00:00Z"`. |
-| `maintenance_window.end_time` | `string` | **[R]** (when block present) | — | End time in RFC 3339 format. Must be on the same day as `start_time`. The window duration must be at least 4 hours. Example: `"2024-01-01T06:00:00Z"`. |
-| `maintenance_window.recurrence` | `string` | **[R]** (when block present) | — | Recurrence rule in RFC 5545 `RRULE` format. Examples: `"FREQ=WEEKLY;BYDAY=SU"` (every Sunday), `"FREQ=WEEKLY;BYDAY=SA,SU"` (weekends). |
-
----
-
-#### Encryption (CMEK)
-
-The entire `encryption` block is optional. When omitted (or `enable_cmek: false`), GCP-managed encryption is used. When enabled, the module creates a KMS key ring and crypto key (or uses an existing key) to encrypt the Composer environment data.
-
-```yaml
-    encryption:
-      enable_cmek: true
-      kms_key_ring_name: "my-keyring"
-      kms_key_name: "my-key"
-      kms_key_rotation_period: "7776000s"
-      existing_kms_key: null
-```
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `encryption.enable_cmek` | `bool` | [O] | `false` | Whether to enable customer-managed encryption keys. When `true`, either creates a new KMS key or uses an existing one. |
-| `encryption.kms_key_ring_name` | `string` | [O] | `"{env-name}-keyring"` | Name of the KMS key ring to create. Only used when `enable_cmek: true` and `existing_kms_key` is not set. Created in the same region as the environment. |
-| `encryption.kms_key_name` | `string` | [O] | `"{env-name}-key"` | Name of the KMS crypto key to create. Only used when `enable_cmek: true` and `existing_kms_key` is not set. |
-| `encryption.kms_key_rotation_period` | `string` | [O] | `"7776000s"` (90 days) | Automatic key rotation period in seconds. Only used for newly created keys. |
-| `encryption.existing_kms_key` | `string` | [O] | `null` | Full resource ID of an existing KMS crypto key. When provided, no new key is created. Format: `projects/{p}/locations/{r}/keyRings/{kr}/cryptoKeys/{k}`. |
-
-**Automatic IAM bindings** (created when CMEK is enabled):
-- `roles/cloudkms.cryptoKeyEncrypterDecrypter` → Composer service agent, Artifact Registry agent, and GCS agent
-
-> **Note**: KMS crypto keys created by the module have `prevent_destroy = true`. To fully destroy the stack, remove the lifecycle block from `modules/composer-3/kms.tf` or use `terraform state rm` first.
-
----
-
-#### Recovery
-
-The entire `recovery` block is optional. When omitted, no scheduled snapshots are configured. When present, it enables periodic environment snapshots for disaster recovery.
-
-```yaml
-    recovery:
-      enable_scheduled_snapshots: true
-      snapshot_location: "europe-west2"
-      snapshot_creation_schedule: "0 3 * * *"
-      time_zone: "UTC"
-```
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `recovery.enable_scheduled_snapshots` | `bool` | [O] | `true` (when block present) | Whether scheduled snapshots are enabled. |
-| `recovery.snapshot_location` | `string` | [O] | Same as environment `region` | GCP region where snapshots are stored. |
-| `recovery.snapshot_creation_schedule` | `string` | [O] | `"0 3 * * *"` (3 AM daily) | Cron expression defining when snapshots are created. Standard 5-field cron format. |
-| `recovery.time_zone` | `string` | [O] | `"UTC"` | Time zone for the cron schedule. Uses IANA time zone names (e.g. `"America/Chicago"`, `"Europe/London"`). |
-
----
-
-#### Data Retention
-
-The entire `data_retention` block is optional. When omitted, GCP uses default retention behaviour. When present, it configures how long Airflow metadata and task logs are retained.
-
-```yaml
-    data_retention:
-      airflow_metadata_retention_config:
-        retention_mode: "RETENTION_MODE_ENABLED"
-        retention_days: 30
-      task_logs_retention_config:
-        storage_mode: "CLOUD_LOGGING_AND_CLOUD_STORAGE"
-```
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `data_retention.airflow_metadata_retention_config.retention_mode` | `string` | [O] | `"RETENTION_MODE_ENABLED"` | Whether metadata retention is active. Allowed values: `RETENTION_MODE_ENABLED`, `RETENTION_MODE_DISABLED`. |
-| `data_retention.airflow_metadata_retention_config.retention_days` | `number` | [O] | `30` | Number of days to retain Airflow metadata (DAG runs, task instances, etc.) before automatic cleanup. |
-| `data_retention.task_logs_retention_config.storage_mode` | `string` | [O] | `"CLOUD_LOGGING_AND_CLOUD_STORAGE"` | Where task logs are stored. `CLOUD_LOGGING_AND_CLOUD_STORAGE` writes to both (recommended). `CLOUD_LOGGING_ONLY` writes only to Cloud Logging. |
-
----
-
-#### Custom Storage
-
-Optional. When omitted, GCP auto-creates a GCS bucket for the environment.
-
-```yaml
-    storage:
-      bucket: "my-custom-bucket"
-```
-
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `storage.bucket` | `string` | [O] | `null` (GCP auto-creates) | Name of a pre-existing GCS bucket to use for the Composer environment's data (DAGs, plugins, logs). The bucket must already exist and be in the same region as the environment. |
-
----
-
-### Full YAML Skeleton (all fields)
-
-Below is a complete YAML skeleton showing every field with its default value. Copy this and remove anything you do not need — every field is optional except `project_id` and `environments`.
-
-```yaml
-# ── Global Defaults ──────────────────────────────────────────────────
-project_id: "my-gcp-project"                         # REQUIRED
-region: "europe-west2"                                 # Default
-enable_apis: true                                      # Default
-apis: []                                               # Default
-labels: {}                                             # Default
-
-# ── Environments ─────────────────────────────────────────────────────
-environments:                                          # REQUIRED (at least one)
-  my-environment:                                      # Key = default env name
-
-    # Identity & Sizing
-    environment_name: "my-environment"                 # Default: YAML key
-    project_id: "my-gcp-project"                       # Default: inherits global
-    region: "europe-west2"                             # Default: inherits global
-    environment_size: "ENVIRONMENT_SIZE_SMALL"          # Default
-    resilience_mode: null                              # Default: standard
-    enable_apis: true                                  # Default: inherits global
-    apis: []                                           # Default: inherits global
-    labels: {}                                         # Default: merged with global
-
-    # Network
-    network:
-      create: true                                     # Default
-      name: "my-environment-network"                   # Default: {env}-network
-      subnetwork_name: "my-environment-subnet"         # Default: {env}-subnet
-      subnetwork_cidr: "10.0.0.0/24"                   # Default
-      existing_network: null                           # Default
-      existing_subnetwork: null                        # Default
-      pods_range_name: "pods"                          # Default
-      pods_cidr: "10.1.0.0/16"                         # Default
-      services_range_name: "services"                  # Default
-      services_cidr: "10.2.0.0/20"                     # Default
-      enable_cloud_nat: false                          # Default
-      tags: ["composer"]                               # Default
-
-    # Service Account
-    service_account:
-      create: true                                     # Default
-      name: "my-environment-sa"                        # Default: {env}-sa
-      existing_email: null                             # Default
-      roles:                                           # Default
-        - "roles/composer.worker"
-        - "roles/logging.logWriter"
-        - "roles/monitoring.metricWriter"
-
-    # Software
-    software_config:
-      image_version: null                              # Default: GCP latest
-      airflow_config_overrides: {}                     # Default
-      env_variables: {}                                # Default
-      pypi_packages: {}                                # Default
-
-    # Workloads
-    workloads:
-      scheduler:
-        cpu: 0.5                                       # Default
-        memory_gb: 2                                   # Default
-        storage_gb: 1                                  # Default
-        count: 1                                       # Default
-      web_server:
-        cpu: 1                                         # Default
-        memory_gb: 2                                   # Default
-        storage_gb: 1                                  # Default
-      worker:
-        cpu: 1                                         # Default
-        memory_gb: 2                                   # Default
-        storage_gb: 1                                  # Default
-        min_count: 1                                   # Default
-        max_count: 3                                   # Default
-      # triggerer:                                     # OMIT to skip creation
-      #   cpu: 0.5                                     # Default when present
-      #   memory_gb: 0.5                               # Default when present
-      #   count: 1                                     # Default when present
-      # dag_processor:                                 # OMIT to skip creation
-      #   cpu: 1                                       # Default when present
-      #   memory_gb: 2                                 # Default when present
-      #   storage_gb: 1                                # Default when present
-      #   count: 1                                     # Default when present
-
-    # Private Environment (omit entire block for public networking)
-    # private_environment:
-    #   enable_private_endpoint: false                  # Default
-    #   cloud_sql_ipv4_cidr_block: null                 # Default: GCP assigns
-    #   web_server_ipv4_cidr_block: null                # Default: GCP assigns
-    #   master_ipv4_cidr_block: null                    # Default: GCP assigns
-    #   cloud_composer_network_ipv4_cidr_block: null    # Default: GCP assigns
-    #   enable_privately_used_public_ips: false          # Default
-    #   connection_type: "VPC_PEERING"                  # Default
-
-    # Master Authorized Networks (omit for no restrictions)
-    # master_authorized_networks:
-    #   enabled: true                                   # Default when present
-    #   cidr_blocks:
-    #     - display_name: "name"                        # REQUIRED per entry
-    #       cidr_block: "0.0.0.0/0"                    # REQUIRED per entry
-
-    # Maintenance Window (omit for GCP-scheduled)
-    # maintenance_window:
-    #   start_time: "2024-01-01T02:00:00Z"             # REQUIRED when present
-    #   end_time: "2024-01-01T06:00:00Z"               # REQUIRED when present
-    #   recurrence: "FREQ=WEEKLY;BYDAY=SU"             # REQUIRED when present
-
-    # Encryption (omit for GCP-managed encryption)
-    # encryption:
-    #   enable_cmek: false                              # Default
-    #   kms_key_ring_name: "my-environment-keyring"    # Default: {env}-keyring
-    #   kms_key_name: "my-environment-key"             # Default: {env}-key
-    #   kms_key_rotation_period: "7776000s"            # Default: 90 days
-    #   existing_kms_key: null                          # Default
-
-    # Recovery (omit for no snapshots)
-    # recovery:
-    #   enable_scheduled_snapshots: true                # Default when present
-    #   snapshot_location: "europe-west2"               # Default: env region
-    #   snapshot_creation_schedule: "0 3 * * *"        # Default: 3 AM daily
-    #   time_zone: "UTC"                               # Default
-
-    # Data Retention (omit for GCP defaults)
-    # data_retention:
-    #   airflow_metadata_retention_config:
-    #     retention_mode: "RETENTION_MODE_ENABLED"      # Default when present
-    #     retention_days: 30                            # Default when present
-    #   task_logs_retention_config:
-    #     storage_mode: "CLOUD_LOGGING_AND_CLOUD_STORAGE"  # Default when present
-
-    # Custom Storage (omit for GCP auto-created bucket)
-    # storage:
-    #   bucket: null                                    # Default: GCP creates
+composer_environments:
+  ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+  GLOBAL-LEVEL FIELDS (root of YAML file, apply to all environments unless overridden)
+  ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+  project_id:                                [Required] The GCP project ID where all resources are
+                                                        created. Can be overridden per-environment.
+
+  region:                                    [Optional] GCP region for all environments. Can be
+                                                        overridden per-environment.
+                                                        Default: "europe-west2"
+
+  enable_apis:                               [Optional] Whether to auto-enable required GCP APIs
+                                                        (composer, compute, iam, cloudresourcemanager,
+                                                        serviceusage). Set false if managed externally.
+                                                        Default: true
+
+  apis:                                      [Optional] Additional GCP API service names to enable
+                                                        beyond the defaults (e.g. "bigquery.googleapis.com").
+                                                        Default: []
+
+  labels:                                    [Optional] Key/value labels applied to all environments.
+      key: value                                        Merged with per-env labels (per-env wins on
+                                                        key conflicts).
+                                                        Default: {}
+
+  environments:                              [Required] Map of Composer environments to create.
+                                                        Each key becomes the default environment name.
+                                                        An empty value {} is valid and uses all defaults.
+                                                        At least one environment must be defined.
+
+  ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+  PER-ENVIRONMENT FIELDS (under environments.<env-key>:, ALL fields are optional)
+  ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+      [ENVIRONMENT_KEY]:                     [Required] The map key. Used as the default environment
+                                                        name, service account name prefix ({key}-sa),
+                                                        network name prefix ({key}-network), and subnet
+                                                        name prefix ({key}-subnet). Must be lowercase
+                                                        alphanumeric with hyphens.
+
+      ── Identity & Sizing ────────────────────────────────────────────────────────────────────────
+
+          environment_name:                  [Optional] Override the Composer environment name. If
+                                                        omitted, the map key is used as the name.
+                                                        Default: ENVIRONMENT_KEY
+
+          project_id:                        [Optional] Override the GCP project for this specific
+                                                        environment.
+                                                        Default: inherits global project_id
+
+          region:                            [Optional] Override the GCP region for this environment.
+                                                        Default: inherits global region -> "europe-west2"
+
+          environment_size:                  [Optional] Composer environment size tier. Controls
+                                                        baseline resource allocation managed by GCP.
+                                                        Allowed: "ENVIRONMENT_SIZE_SMALL",
+                                                                 "ENVIRONMENT_SIZE_MEDIUM",
+                                                                 "ENVIRONMENT_SIZE_LARGE"
+                                                        Default: "ENVIRONMENT_SIZE_SMALL"
+
+          resilience_mode:                   [Optional] Set to "HIGH_RESILIENCE" to enable multi-zone
+                                                        redundancy for the scheduler, database, and
+                                                        web server.
+                                                        Allowed: "STANDARD_RESILIENCE", "HIGH_RESILIENCE"
+                                                        Default: not set (standard resilience)
+
+          labels:                            [Optional] Key/value labels for this environment. Merged
+              key: value                                with global labels; per-env wins on conflicts.
+                                                        Default: {}
+
+          enable_apis:                       [Optional] Override API enablement for this environment.
+                                                        Default: inherits global enable_apis -> true
+
+          apis:                              [Optional] Override additional APIs for this environment.
+                                                        Default: inherits global apis -> []
+
+      ── Network ──────────────────────────────────────────────────────────────────────────────────
+      (entire block optional; when omitted, a dedicated VPC is created per environment)
+
+          network:
+              create:                        [Optional] Whether to create a new VPC network and subnet.
+                                                        Set false to use an existing network (provide
+                                                        existing_network and existing_subnetwork).
+                                                        Default: true
+
+              name:                          [Optional] Name of the VPC network to create. Only used
+                                                        when create: true.
+                                                        Default: "{env-name}-network"
+
+              subnetwork_name:               [Optional] Name of the subnet to create. Only used when
+                                                        create: true.
+                                                        Default: "{env-name}-subnet"
+
+              subnetwork_cidr:               [Optional] Primary CIDR range for the subnet. Used for
+                                                        Composer infrastructure nodes.
+                                                        Default: "10.0.0.0/24"
+
+              existing_network:              [Optional] Full self-link of an existing VPC network.
+                                                        Required when create: false. Format:
+                                                        projects/{project}/global/networks/{name}
+                                                        Default: null
+
+              existing_subnetwork:           [Optional] Full self-link of an existing subnet. Required
+                                                        when create: false. Must have secondary ranges
+                                                        matching pods_range_name and services_range_name.
+                                                        Format: projects/{p}/regions/{r}/subnetworks/{n}
+                                                        Default: null
+
+              pods_range_name:               [Optional] Name of the secondary IP range for GKE pods.
+                                                        When using an existing subnet, must match an
+                                                        existing secondary range name.
+                                                        Default: "pods"
+
+              pods_cidr:                     [Optional] CIDR range for the pods secondary range. Only
+                                                        used when create: true. A /16 provides ~65k IPs.
+                                                        Default: "10.1.0.0/16"
+
+              services_range_name:           [Optional] Name of the secondary IP range for GKE services.
+                                                        When using an existing subnet, must match an
+                                                        existing secondary range name.
+                                                        Default: "services"
+
+              services_cidr:                 [Optional] CIDR range for the services secondary range.
+                                                        Only used when create: true. A /20 provides ~4k.
+                                                        Default: "10.2.0.0/20"
+
+              enable_cloud_nat:              [Optional] Whether to create a Cloud Router and Cloud NAT
+                                                        for outbound internet access. Set true when using
+                                                        private environments so workers can reach PyPI.
+                                                        Default: false
+
+              tags:                          [Optional] Network tags applied to Composer nodes. Used as
+                  - "composer"                          targets for the auto-created firewall rules.
+                                                        Default: ["composer"]
+
+          When create: true, the module also creates:
+            - Firewall rule allowing internal TCP/UDP/ICMP between all CIDR ranges
+            - Firewall rule allowing GCP health check source ranges (35.191.0.0/16, 130.211.0.0/22)
+            - (If enable_cloud_nat: true) Cloud Router + Cloud NAT with auto-allocated IPs
+
+      ── Service Account ──────────────────────────────────────────────────────────────────────────
+      (entire block optional; when omitted, SA auto-created as {env-name}-sa)
+
+          service_account:
+              create:                        [Optional] Whether to create a new service account. Set
+                                                        false to use an existing one.
+                                                        Default: true
+
+              name:                          [Optional] The account_id for the new SA (max 30 chars,
+                                                        lowercase alphanumeric + hyphens). Only used
+                                                        when create: true.
+                                                        Default: "{env-name}-sa"
+
+              existing_email:                [Optional] Email of an existing SA. Required when
+                                                        create: false. Format: name@project.iam...
+                                                        Default: null
+
+              roles:                         [Optional] IAM roles granted to the SA on the project.
+                  - "roles/composer.worker"             roles/composer.worker is required for Composer
+                  - "roles/logging.logWriter"           to function — always include it.
+                  - "roles/monitoring.metricWriter"     Default: [roles/composer.worker,
+                                                                  roles/logging.logWriter,
+                                                                  roles/monitoring.metricWriter]
+
+          Automatic IAM bindings (always created, not configurable):
+            - roles/composer.ServiceAgentV2Ext -> Composer service agent on the project
+            - roles/iam.serviceAccountUser     -> Composer service agent on the env SA
+
+      ── Software Configuration ───────────────────────────────────────────────────────────────────
+      (entire block optional; when omitted, GCP selects the latest stable Composer 3 image)
+
+          software_config:
+              image_version:                 [Optional] Composer image version string. When omitted,
+                                                        GCP selects the latest stable Composer 3 version.
+                                                        Must start with "composer-3" if provided. Check
+                                                        available: gcloud composer environments
+                                                        list-image-versions --location=REGION
+                                                        Default: null (GCP picks latest)
+
+              airflow_config_overrides:      [Optional] Airflow configuration property overrides.
+                  section-key: "value"                  Keys use section-key format with a HYPHEN
+                                                        separator (not dot). Example: core-dags_are_
+                                                        paused_at_creation maps to [core] dags_are_
+                                                        paused_at_creation in airflow.cfg. Values
+                                                        must be strings.
+                                                        Default: {}
+
+              env_variables:                 [Optional] Environment variables injected into all
+                  key: "value"                          Airflow components. Available in DAGs via
+                                                        os.environ. Do not use for secrets.
+                                                        Default: {}
+
+              pypi_packages:                 [Optional] Additional PyPI packages to install. Keys
+                  package_name: ">=1.0.0"               are package names, values are version specifiers
+                                                        (e.g. ">=10.0.0", "==2.1.0", ""). To install
+                                                        without pinning, use empty string as value.
+                                                        Default: {}
+
+      ── Workloads ────────────────────────────────────────────────────────────────────────────────
+      (entire block optional; scheduler, web_server, worker always created with defaults;
+       triggerer and dag_processor ONLY created when their block is explicitly present)
+
+          workloads:
+
+              scheduler:                     [Optional] Parses DAGs and schedules task execution.
+                                                        Always created.
+                  cpu:                       [Optional] vCPUs allocated to each scheduler instance.
+                                                        Default: 0.5
+                  memory_gb:                 [Optional] Memory in GB per scheduler instance.
+                                                        Default: 2
+                  storage_gb:                [Optional] Storage in GB per scheduler instance.
+                                                        Default: 1
+                  count:                     [Optional] Number of scheduler instances. Set to 2
+                                                        for high availability.
+                                                        Default: 1
+
+              web_server:                    [Optional] Serves the Airflow UI. Always created
+                                                        (single instance).
+                  cpu:                       [Optional] vCPUs allocated to the web server.
+                                                        Default: 1
+                  memory_gb:                 [Optional] Memory in GB for the web server.
+                                                        Default: 2
+                  storage_gb:                [Optional] Storage in GB for the web server.
+                                                        Default: 1
+
+              worker:                        [Optional] Executes Airflow tasks. Always created with
+                                                        autoscaling between min_count and max_count.
+                  cpu:                       [Optional] vCPUs allocated to each worker instance.
+                                                        Default: 1
+                  memory_gb:                 [Optional] Memory in GB per worker instance.
+                                                        Default: 2
+                  storage_gb:                [Optional] Storage in GB per worker instance.
+                                                        Default: 1
+                  min_count:                 [Optional] Minimum number of workers (always running).
+                                                        Default: 1
+                  max_count:                 [Optional] Maximum number of workers (autoscale ceiling).
+                                                        Default: 3
+
+              triggerer:                     [Optional] Monitors deferred tasks and resumes them when
+                                                        conditions are met (e.g. sensor completion).
+                                                        ** ONLY created when this block is present. **
+                                                        Omit the entire triggerer: key to skip creation.
+                  cpu:                       [Optional] vCPUs per triggerer instance.
+                                                        Default: 0.5 (when block present)
+                  memory_gb:                 [Optional] Memory in GB per triggerer instance.
+                                                        Default: 0.5 (when block present)
+                  count:                     [Optional] Number of triggerer instances.
+                                                        Default: 1 (when block present)
+
+              dag_processor:                 [Optional] Separate process for parsing DAG files
+                                                        (Composer 3 feature).
+                                                        ** ONLY created when this block is present. **
+                                                        Omit the entire dag_processor: key to skip.
+                  cpu:                       [Optional] vCPUs per DAG processor instance.
+                                                        Default: 1 (when block present)
+                  memory_gb:                 [Optional] Memory in GB per DAG processor instance.
+                                                        Default: 2 (when block present)
+                  storage_gb:                [Optional] Storage in GB per DAG processor instance.
+                                                        Default: 1 (when block present)
+                  count:                     [Optional] Number of DAG processor instances.
+                                                        Default: 1 (when block present)
+
+      ── Private Environment ──────────────────────────────────────────────────────────────────────
+      (entire block optional; omit for public IP networking)
+
+          private_environment:
+              enable_private_endpoint:       [Optional] When true, the Airflow web server has no
+                                                        public IP. Requires VPN, bastion, or IAP.
+                                                        When true, also set network.enable_cloud_nat
+                                                        to true for outbound connectivity.
+                                                        Default: false
+
+              cloud_sql_ipv4_cidr_block:     [Optional] CIDR block for the Cloud SQL instance. Must
+                                                        not overlap with other ranges.
+                                                        Default: null (GCP auto-assigns)
+
+              web_server_ipv4_cidr_block:    [Optional] CIDR block for the Airflow web server.
+                                                        Default: null (GCP auto-assigns)
+
+              master_ipv4_cidr_block:        [Optional] CIDR block for the GKE control plane. Must
+                                                        be a /28 range.
+                                                        Default: null (GCP auto-assigns)
+
+              cloud_composer_network_ipv4_cidr_block:
+                                             [Optional] CIDR block for the Cloud Composer networking
+                                                        infrastructure.
+                                                        Default: null (GCP auto-assigns)
+
+              enable_privately_used_public_ips:
+                                             [Optional] When true, allows using publicly-routable IP
+                                                        ranges for private GKE endpoints.
+                                                        Default: false
+
+              connection_type:               [Optional] Network connection type.
+                                                        "VPC_PEERING" creates a VPC peering connection.
+                                                        "PRIVATE_SERVICE_CONNECT" uses PSC (recommended
+                                                        for Composer 3).
+                                                        Default: "VPC_PEERING"
+
+      ── Master Authorized Networks ───────────────────────────────────────────────────────────────
+      (entire block optional; omit for no restrictions on control plane access)
+
+          master_authorized_networks:
+              enabled:                       [Optional] Whether master authorized networks are enforced.
+                                                        Default: true (when block present)
+
+              cidr_blocks:                   [Optional] List of CIDR blocks allowed to access the
+                                                        GKE control plane.
+                                                        Default: []
+                  - display_name:            [Required] Human-readable name (e.g. "office-vpn").
+                    cidr_block:              [Required] IP range in CIDR notation (e.g. "10.0.0.0/8").
+
+      ── Maintenance Window ───────────────────────────────────────────────────────────────────────
+      (entire block optional; omit to let GCP schedule maintenance at any time)
+
+          maintenance_window:
+              start_time:                    [Required] Start time in RFC 3339 format. Only the
+                                                        time-of-day matters; the date is an anchor.
+                                                        Example: "2024-01-01T02:00:00Z"
+
+              end_time:                      [Required] End time in RFC 3339 format. Must be same
+                                                        day as start_time. Window must be >= 4 hours.
+                                                        Example: "2024-01-01T06:00:00Z"
+
+              recurrence:                    [Required] Recurrence rule in RFC 5545 RRULE format.
+                                                        Example: "FREQ=WEEKLY;BYDAY=SU" (every Sunday)
+
+      ── Encryption (CMEK) ────────────────────────────────────────────────────────────────────────
+      (entire block optional; omit for GCP-managed encryption)
+
+          encryption:
+              enable_cmek:                   [Optional] Whether to enable customer-managed encryption
+                                                        keys. When true, creates a new KMS key or uses
+                                                        an existing one.
+                                                        Default: false
+
+              kms_key_ring_name:             [Optional] Name of the KMS key ring to create. Only used
+                                                        when enable_cmek: true and existing_kms_key is
+                                                        not set. Created in the same region.
+                                                        Default: "{env-name}-keyring"
+
+              kms_key_name:                  [Optional] Name of the KMS crypto key to create. Only
+                                                        used when enable_cmek: true and existing_kms_key
+                                                        is not set.
+                                                        Default: "{env-name}-key"
+
+              kms_key_rotation_period:       [Optional] Automatic key rotation period in seconds.
+                                                        Only used for newly created keys.
+                                                        Default: "7776000s" (90 days)
+
+              existing_kms_key:              [Optional] Full resource ID of an existing KMS key. When
+                                                        provided, no new key is created. Format:
+                                                        projects/{p}/locations/{r}/keyRings/{kr}/
+                                                        cryptoKeys/{k}
+                                                        Default: null
+
+          Automatic IAM bindings (created when CMEK enabled):
+            - roles/cloudkms.cryptoKeyEncrypterDecrypter -> Composer agent, AR agent, GCS agent
+
+          Note: KMS keys created by the module have prevent_destroy = true. To destroy, remove the
+          lifecycle block from modules/composer-3/kms.tf or use terraform state rm first.
+
+      ── Recovery ─────────────────────────────────────────────────────────────────────────────────
+      (entire block optional; omit for no scheduled snapshots)
+
+          recovery:
+              enable_scheduled_snapshots:    [Optional] Whether scheduled snapshots are enabled.
+                                                        Default: true (when block present)
+
+              snapshot_location:             [Optional] GCP region where snapshots are stored.
+                                                        Default: same as environment region
+
+              snapshot_creation_schedule:    [Optional] Cron expression for snapshot creation.
+                                                        Standard 5-field cron format.
+                                                        Default: "0 3 * * *" (3 AM daily)
+
+              time_zone:                     [Optional] Time zone for the cron schedule. Uses IANA
+                                                        names (e.g. "America/Chicago", "Europe/London").
+                                                        Default: "UTC"
+
+      ── Data Retention ───────────────────────────────────────────────────────────────────────────
+      (entire block optional; omit for GCP default retention behaviour)
+
+          data_retention:
+              airflow_metadata_retention_config:
+                  retention_mode:            [Optional] Whether metadata retention is active.
+                                                        Allowed: "RETENTION_MODE_ENABLED",
+                                                                 "RETENTION_MODE_DISABLED"
+                                                        Default: "RETENTION_MODE_ENABLED"
+
+                  retention_days:            [Optional] Number of days to retain Airflow metadata
+                                                        (DAG runs, task instances) before cleanup.
+                                                        Default: 30
+
+              task_logs_retention_config:
+                  storage_mode:              [Optional] Where task logs are stored.
+                                                        "CLOUD_LOGGING_AND_CLOUD_STORAGE" writes to
+                                                        both (recommended).
+                                                        "CLOUD_LOGGING_ONLY" writes only to Logging.
+                                                        Default: "CLOUD_LOGGING_AND_CLOUD_STORAGE"
+
+      ── Custom Storage ───────────────────────────────────────────────────────────────────────────
+      (optional; omit for GCP auto-created bucket)
+
+          storage:
+              bucket:                        [Optional] Name of a pre-existing GCS bucket to use for
+                                                        the environment's data (DAGs, plugins, logs).
+                                                        Must exist and be in the same region.
+                                                        Default: null (GCP auto-creates)
 ```
 
 ---
