@@ -1,0 +1,130 @@
+# ============================================================================
+# Production Configuration — Single Environment
+# Full-featured: HA, CMEK, Cloud NAT, DAG processor, scheduled snapshots,
+# data retention, master authorized networks.
+# ============================================================================
+
+project_id: "my-prod-project"
+region: "us-central1"
+
+labels:
+  managed_by: terraform
+  cost_center: "cc-1234"
+
+environments:
+  composer-prod:
+    environment_size: "ENVIRONMENT_SIZE_LARGE"
+    resilience_mode: "HIGH_RESILIENCE"
+
+    labels:
+      env: production
+      team: data-engineering
+
+    network:
+      name: "composer-prod-network"
+      subnetwork_name: "composer-prod-subnet"
+      subnetwork_cidr: "10.0.0.0/24"
+      pods_range_name: "composer-pods"
+      pods_cidr: "10.4.0.0/14"
+      services_range_name: "composer-services"
+      services_cidr: "10.8.0.0/20"
+      enable_cloud_nat: true
+      tags:
+        - "composer"
+        - "production"
+
+    service_account:
+      roles:
+        - "roles/composer.worker"
+        - "roles/logging.logWriter"
+        - "roles/monitoring.metricWriter"
+        - "roles/storage.objectAdmin"
+        - "roles/bigquery.dataEditor"
+        - "roles/bigquery.jobUser"
+        - "roles/dataflow.worker"
+        - "roles/secretmanager.secretAccessor"
+
+    software_config:
+      image_version: "composer-3-airflow-2.10.2"
+      airflow_config_overrides:
+        core-dags_are_paused_at_creation: "True"
+        core-max_active_runs_per_dag: "5"
+        celery-worker_concurrency: "16"
+        webserver-expose_config: "False"
+        webserver-dag_default_view: "grid"
+        scheduler-dag_dir_list_interval: "60"
+      env_variables:
+        ENVIRONMENT: "production"
+      pypi_packages:
+        apache-airflow-providers-google: ">=10.0.0"
+        apache-airflow-providers-cncf-kubernetes: ">=8.0.0"
+        apache-airflow-providers-slack: ">=8.0.0"
+        sentry-sdk: ">=1.0.0"
+        pandas: ">=2.0.0"
+        google-cloud-bigquery: ">=3.0.0"
+
+    workloads:
+      scheduler:
+        cpu: 4
+        memory_gb: 8
+        storage_gb: 10
+        count: 2
+      web_server:
+        cpu: 4
+        memory_gb: 8
+        storage_gb: 10
+      worker:
+        cpu: 4
+        memory_gb: 16
+        storage_gb: 10
+        min_count: 3
+        max_count: 12
+      triggerer:
+        cpu: 1
+        memory_gb: 1
+        count: 2
+      dag_processor:
+        cpu: 2
+        memory_gb: 4
+        storage_gb: 5
+        count: 2
+
+    private_environment:
+      enable_private_endpoint: false
+      cloud_sql_ipv4_cidr_block: "10.10.0.0/24"
+      web_server_ipv4_cidr_block: "10.10.1.0/24"
+      master_ipv4_cidr_block: "10.10.2.0/28"
+      cloud_composer_network_ipv4_cidr_block: "10.10.3.0/24"
+      connection_type: "VPC_PEERING"
+
+    master_authorized_networks:
+      enabled: true
+      cidr_blocks:
+        - display_name: "office-vpn"
+          cidr_block: "203.0.113.0/24"
+        - display_name: "cicd-runners"
+          cidr_block: "198.51.100.0/24"
+
+    maintenance_window:
+      start_time: "2024-01-01T02:00:00Z"
+      end_time: "2024-01-01T06:00:00Z"
+      recurrence: "FREQ=WEEKLY;BYDAY=SU"
+
+    encryption:
+      enable_cmek: true
+      kms_key_ring_name: "composer-prod-keyring"
+      kms_key_name: "composer-prod-key"
+      kms_key_rotation_period: "7776000s"
+
+    recovery:
+      enable_scheduled_snapshots: true
+      snapshot_location: "us-central1"
+      snapshot_creation_schedule: "0 3 * * *"
+      time_zone: "America/Chicago"
+
+    data_retention:
+      airflow_metadata_retention_config:
+        retention_mode: "RETENTION_MODE_ENABLED"
+        retention_days: 90
+      task_logs_retention_config:
+        storage_mode: "CLOUD_LOGGING_AND_CLOUD_STORAGE"

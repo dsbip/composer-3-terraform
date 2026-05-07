@@ -1,0 +1,10 @@
+# ============================================================================
+# Basic Configuration — Single Environment
+# Minimal YAML: just project_id and an environment key.
+# Everything else uses module defaults.
+# ============================================================================
+
+project_id: "my-gcp-project"
+
+environments:
+  composer-basic: {}

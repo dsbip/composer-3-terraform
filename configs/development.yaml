@@ -1,0 +1,38 @@
+# ============================================================================
+# Development Configuration — Single Environment
+# Cost-optimised setup with short retention and relaxed Airflow settings.
+# Omitted fields use module defaults (region=europe-west2, size=SMALL, etc.).
+# ============================================================================
+
+project_id: "my-dev-project"
+
+labels:
+  managed_by: terraform
+
+environments:
+  composer-dev:
+    labels:
+      env: development
+      team: data-engineering
+
+    software_config:
+      airflow_config_overrides:
+        core-dags_are_paused_at_creation: "False"
+        webserver-expose_config: "True"
+      env_variables:
+        ENVIRONMENT: "development"
+      pypi_packages:
+        apache-airflow-providers-google: ">=10.0.0"
+        pandas: ">=2.0.0"
+
+    maintenance_window:
+      start_time: "2024-01-01T06:00:00Z"
+      end_time: "2024-01-01T10:00:00Z"
+      recurrence: "FREQ=WEEKLY;BYDAY=SA"
+
+    data_retention:
+      airflow_metadata_retention_config:
+        retention_mode: "RETENTION_MODE_ENABLED"
+        retention_days: 14
+      task_logs_retention_config:
+        storage_mode: "CLOUD_LOGGING_ONLY"

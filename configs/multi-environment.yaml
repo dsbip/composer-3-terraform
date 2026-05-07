@@ -1,0 +1,159 @@
+# ============================================================================
+# Multi-Environment Configuration
+# Demonstrates deploying dev, staging, and prod Composer environments
+# from a single YAML file. Global settings apply to all unless overridden.
+# ============================================================================
+
+project_id: "my-gcp-project"
+region: "europe-west2"
+
+labels:
+  managed_by: terraform
+  team: data-engineering
+
+environments:
+
+  # ── Dev: minimal, cost-optimised ─────────────────────────────────────
+  composer-dev:
+    labels:
+      env: dev
+    software_config:
+      env_variables:
+        ENVIRONMENT: "dev"
+
+  # ── Staging: medium, private, with triggerer ─────────────────────────
+  composer-staging:
+    environment_size: "ENVIRONMENT_SIZE_MEDIUM"
+
+    labels:
+      env: staging
+
+    network:
+      subnetwork_cidr: "10.10.0.0/24"
+      pods_cidr: "10.11.0.0/16"
+      services_cidr: "10.12.0.0/20"
+      enable_cloud_nat: true
+
+    software_config:
+      env_variables:
+        ENVIRONMENT: "staging"
+      pypi_packages:
+        apache-airflow-providers-google: ">=10.0.0"
+
+    workloads:
+      scheduler:
+        cpu: 1
+        memory_gb: 4
+        count: 2
+      worker:
+        cpu: 2
+        memory_gb: 4
+        min_count: 2
+        max_count: 6
+      triggerer:
+        cpu: 0.5
+        memory_gb: 0.5
+        count: 1
+
+    private_environment:
+      enable_private_endpoint: false
+      cloud_sql_ipv4_cidr_block: "10.13.0.0/24"
+
+    maintenance_window:
+      start_time: "2024-01-01T04:00:00Z"
+      end_time: "2024-01-01T08:00:00Z"
+      recurrence: "FREQ=WEEKLY;BYDAY=SA"
+
+  # ── Prod: large, HA, CMEK, full workloads ────────────────────────────
+  composer-prod:
+    environment_size: "ENVIRONMENT_SIZE_LARGE"
+    resilience_mode: "HIGH_RESILIENCE"
+
+    labels:
+      env: production
+
+    network:
+      subnetwork_cidr: "10.20.0.0/24"
+      pods_cidr: "10.21.0.0/14"
+      services_cidr: "10.25.0.0/20"
+      enable_cloud_nat: true
+      tags:
+        - "composer"
+        - "production"
+
+    service_account:
+      roles:
+        - "roles/composer.worker"
+        - "roles/logging.logWriter"
+        - "roles/monitoring.metricWriter"
+        - "roles/storage.objectAdmin"
+        - "roles/bigquery.dataEditor"
+        - "roles/bigquery.jobUser"
+        - "roles/secretmanager.secretAccessor"
+
+    software_config:
+      airflow_config_overrides:
+        core-dags_are_paused_at_creation: "True"
+        core-max_active_runs_per_dag: "5"
+        celery-worker_concurrency: "16"
+      env_variables:
+        ENVIRONMENT: "production"
+      pypi_packages:
+        apache-airflow-providers-google: ">=10.0.0"
+        apache-airflow-providers-slack: ">=8.0.0"
+        pandas: ">=2.0.0"
+
+    workloads:
+      scheduler:
+        cpu: 4
+        memory_gb: 8
+        storage_gb: 10
+        count: 2
+      web_server:
+        cpu: 4
+        memory_gb: 8
+        storage_gb: 10
+      worker:
+        cpu: 4
+        memory_gb: 16
+        storage_gb: 10
+        min_count: 3
+        max_count: 12
+      triggerer:
+        cpu: 1
+        memory_gb: 1
+        count: 2
+      dag_processor:
+        cpu: 2
+        memory_gb: 4
+        storage_gb: 5
+        count: 2
+
+    private_environment:
+      enable_private_endpoint: false
+      cloud_sql_ipv4_cidr_block: "10.26.0.0/24"
+      web_server_ipv4_cidr_block: "10.26.1.0/24"
+      master_ipv4_cidr_block: "10.26.2.0/28"
+      cloud_composer_network_ipv4_cidr_block: "10.26.3.0/24"
+
+    encryption:
+      enable_cmek: true
+      kms_key_ring_name: "composer-prod-keyring"
+      kms_key_name: "composer-prod-key"
+
+    maintenance_window:
+      start_time: "2024-01-01T02:00:00Z"
+      end_time: "2024-01-01T06:00:00Z"
+      recurrence: "FREQ=WEEKLY;BYDAY=SU"
+
+    recovery:
+      enable_scheduled_snapshots: true
+      snapshot_creation_schedule: "0 3 * * *"
+      time_zone: "Europe/London"
+
+    data_retention:
+      airflow_metadata_retention_config:
+        retention_mode: "RETENTION_MODE_ENABLED"
+        retention_days: 90
+      task_logs_retention_config:
+        storage_mode: "CLOUD_LOGGING_AND_CLOUD_STORAGE"

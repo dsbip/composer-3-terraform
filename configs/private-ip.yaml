@@ -1,0 +1,93 @@
+# ============================================================================
+# Private IP Configuration — Single Environment
+# Fully private: Private Service Connect, no public endpoint, Cloud NAT,
+# master authorized networks, HA resilience.
+# ============================================================================
+
+project_id: "my-secure-project"
+region: "europe-west1"
+
+labels:
+  managed_by: terraform
+  security: high
+
+environments:
+  composer-private:
+    environment_size: "ENVIRONMENT_SIZE_MEDIUM"
+    resilience_mode: "HIGH_RESILIENCE"
+
+    labels:
+      env: staging
+      team: platform
+
+    network:
+      subnetwork_cidr: "10.20.0.0/24"
+      pods_cidr: "10.24.0.0/14"
+      services_cidr: "10.28.0.0/20"
+      enable_cloud_nat: true
+      tags:
+        - "composer"
+        - "private"
+        - "no-public-ip"
+
+    software_config:
+      airflow_config_overrides:
+        core-dags_are_paused_at_creation: "True"
+        webserver-expose_config: "False"
+      env_variables:
+        ENVIRONMENT: "staging"
+      pypi_packages:
+        apache-airflow-providers-google: ">=10.0.0"
+
+    workloads:
+      scheduler:
+        cpu: 2
+        memory_gb: 4
+        storage_gb: 5
+        count: 2
+      web_server:
+        cpu: 2
+        memory_gb: 4
+        storage_gb: 5
+      worker:
+        cpu: 2
+        memory_gb: 8
+        storage_gb: 5
+        min_count: 2
+        max_count: 6
+      triggerer:
+        cpu: 0.5
+        memory_gb: 1
+        count: 1
+      dag_processor:
+        cpu: 1
+        memory_gb: 2
+        storage_gb: 2
+        count: 1
+
+    private_environment:
+      enable_private_endpoint: true
+      cloud_sql_ipv4_cidr_block: "10.30.0.0/24"
+      web_server_ipv4_cidr_block: "10.30.1.0/24"
+      master_ipv4_cidr_block: "10.30.2.0/28"
+      cloud_composer_network_ipv4_cidr_block: "10.30.3.0/24"
+      connection_type: "PRIVATE_SERVICE_CONNECT"
+
+    master_authorized_networks:
+      enabled: true
+      cidr_blocks:
+        - display_name: "corporate-vpn"
+          cidr_block: "10.0.0.0/8"
+        - display_name: "bastion-host"
+          cidr_block: "10.20.0.10/32"
+
+    maintenance_window:
+      start_time: "2024-01-01T01:00:00Z"
+      end_time: "2024-01-01T05:00:00Z"
+      recurrence: "FREQ=WEEKLY;BYDAY=SU"
+
+    recovery:
+      enable_scheduled_snapshots: true
+      snapshot_location: "europe-west1"
+      snapshot_creation_schedule: "0 2 * * *"
+      time_zone: "Europe/London"
