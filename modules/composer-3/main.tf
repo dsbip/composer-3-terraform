@@ -10,16 +10,19 @@ resource "google_composer_environment" "this" {
     environment_size = local.environment_size
     resilience_mode  = local.resilience_mode
 
-    node_config {
-      network         = local.network_self_link
-      subnetwork      = local.subnetwork_self_link
-      service_account = local.composer_sa_email
-      tags            = local.network.tags
+    # Composer 3 networking type: Public IP (default) or Private IP.
+    enable_private_environment = local.enable_private_environment
+    enable_private_builds_only = local.enable_private_builds_only
 
-      ip_allocation_policy {
-        cluster_secondary_range_name  = local.network.pods_range_name
-        services_secondary_range_name = local.network.services_range_name
-      }
+    node_config {
+      # Either network + subnetwork (Composer creates the PSC network attachment) or a
+      # pre-created composer_network_attachment; all null = not attached to any VPC.
+      network                           = local.network_self_link
+      subnetwork                        = local.subnetwork_self_link
+      composer_network_attachment       = local.network.existing_network_attachment
+      composer_internal_ipv4_cidr_block = local.network.composer_internal_ipv4_cidr_block
+      service_account                   = local.composer_sa_email
+      tags                              = local.network.tags
     }
 
     software_config {
@@ -27,6 +30,14 @@ resource "google_composer_environment" "this" {
       airflow_config_overrides = local.software_config.airflow_config_overrides
       env_variables            = local.software_config.env_variables
       pypi_packages            = local.software_config.pypi_packages
+      web_server_plugins_mode  = local.software_config.web_server_plugins_mode
+
+      dynamic "cloud_data_lineage_integration" {
+        for_each = local.software_config.cloud_data_lineage != null ? [local.software_config.cloud_data_lineage] : []
+        content {
+          enabled = cloud_data_lineage_integration.value
+        }
+      }
     }
 
     workloads_config {
@@ -71,29 +82,14 @@ resource "google_composer_environment" "this" {
       }
     }
 
-    dynamic "private_environment_config" {
-      for_each = local.private_environment != null ? [local.private_environment] : []
+    dynamic "web_server_network_access_control" {
+      for_each = local.web_server_access_control_enabled ? [local.web_server_allowed_ip_ranges] : []
       content {
-        enable_private_endpoint                = private_environment_config.value.enable_private_endpoint
-        cloud_sql_ipv4_cidr_block              = private_environment_config.value.cloud_sql_ipv4_cidr_block
-        web_server_ipv4_cidr_block             = private_environment_config.value.web_server_ipv4_cidr_block
-        master_ipv4_cidr_block                 = private_environment_config.value.master_ipv4_cidr_block
-        cloud_composer_network_ipv4_cidr_block = private_environment_config.value.cloud_composer_network_ipv4_cidr_block
-        enable_privately_used_public_ips       = private_environment_config.value.enable_privately_used_public_ips
-        connection_type                        = private_environment_config.value.connection_type
-      }
-    }
-
-    dynamic "master_authorized_networks_config" {
-      for_each = local.master_authorized_networks != null ? [local.master_authorized_networks] : []
-      content {
-        enabled = try(master_authorized_networks_config.value.enabled, true)
-
-        dynamic "cidr_blocks" {
-          for_each = try(master_authorized_networks_config.value.cidr_blocks, [])
+        dynamic "allowed_ip_range" {
+          for_each = web_server_network_access_control.value
           content {
-            display_name = cidr_blocks.value.display_name
-            cidr_block   = cidr_blocks.value.cidr_block
+            value       = allowed_ip_range.value.value
+            description = allowed_ip_range.value.description
           }
         }
       }
@@ -119,30 +115,20 @@ resource "google_composer_environment" "this" {
       for_each = local.recovery != null ? [local.recovery] : []
       content {
         scheduled_snapshots_config {
-          enabled                    = try(recovery_config.value.enable_scheduled_snapshots, true)
-          snapshot_location          = try(recovery_config.value.snapshot_location, local.region)
-          snapshot_creation_schedule = try(recovery_config.value.snapshot_creation_schedule, "0 3 * * *")
-          time_zone                  = try(recovery_config.value.time_zone, "UTC")
+          enabled                    = recovery_config.value.enabled
+          snapshot_location          = recovery_config.value.enabled ? recovery_config.value.snapshot_location : null
+          snapshot_creation_schedule = recovery_config.value.enabled ? recovery_config.value.snapshot_creation_schedule : null
+          time_zone                  = recovery_config.value.enabled ? recovery_config.value.time_zone : null
         }
       }
     }
 
     dynamic "data_retention_config" {
-      for_each = local.data_retention != null ? [local.data_retention] : []
+      for_each = local.metadata_retention != null ? [local.metadata_retention] : []
       content {
-        dynamic "airflow_metadata_retention_config" {
-          for_each = try(data_retention_config.value.airflow_metadata_retention_config, null) != null ? [data_retention_config.value.airflow_metadata_retention_config] : []
-          content {
-            retention_mode = try(airflow_metadata_retention_config.value.retention_mode, "RETENTION_MODE_ENABLED")
-            retention_days = try(airflow_metadata_retention_config.value.retention_days, 30)
-          }
-        }
-
-        dynamic "task_logs_retention_config" {
-          for_each = try(data_retention_config.value.task_logs_retention_config, null) != null ? [data_retention_config.value.task_logs_retention_config] : []
-          content {
-            storage_mode = try(task_logs_retention_config.value.storage_mode, "CLOUD_LOGGING_AND_CLOUD_STORAGE")
-          }
+        airflow_metadata_retention_config {
+          retention_mode = data_retention_config.value.retention_mode
+          retention_days = data_retention_config.value.retention_days
         }
       }
     }
@@ -155,14 +141,20 @@ resource "google_composer_environment" "this" {
     }
   }
 
+  lifecycle {
+    # All configuration checks from validation.tf, reported together.
+    precondition {
+      condition     = length(local.validation_errors) == 0
+      error_message = "Invalid configuration for Composer environment \"${var.environment_key}\":\n  - ${join("\n  - ", local.validation_errors)}"
+    }
+  }
+
   depends_on = [
     google_project_service.required,
     google_project_iam_member.composer_sa_roles,
-    google_project_iam_member.composer_agent_v2ext,
     google_service_account_iam_member.composer_agent_sa_user,
     google_kms_crypto_key_iam_member.composer_agent_kms,
-    google_kms_crypto_key_iam_member.artifact_registry_kms,
-    google_kms_crypto_key_iam_member.gcs_kms,
+    google_kms_crypto_key_iam_member.gcs_agent_kms,
     google_compute_subnetwork.composer,
     google_compute_router_nat.composer,
   ]

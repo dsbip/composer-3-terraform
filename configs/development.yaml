@@ -1,6 +1,6 @@
 # ============================================================================
 # Development Configuration — Single Environment
-# Cost-optimised setup with short retention and relaxed Airflow settings.
+# Cost-optimised setup with minimum metadata retention and relaxed Airflow settings.
 # Omitted fields use module defaults (region=europe-west2, size=SMALL, etc.).
 # ============================================================================
 
@@ -25,14 +25,14 @@ environments:
         apache-airflow-providers-google: ">=10.0.0"
         pandas: ">=2.0.0"
 
+    # Composer needs >= 12 hours of maintenance per week and >= 4 hours per slot:
+    # 4 hours on Friday, Saturday and Sunday = 12 hours.
     maintenance_window:
       start_time: "2024-01-01T06:00:00Z"
       end_time: "2024-01-01T10:00:00Z"
-      recurrence: "FREQ=WEEKLY;BYDAY=SA"
+      recurrence: "FREQ=WEEKLY;BYDAY=FR,SA,SU"
 
     data_retention:
       airflow_metadata_retention_config:
         retention_mode: "RETENTION_MODE_ENABLED"
-        retention_days: 14
-      task_logs_retention_config:
-        storage_mode: "CLOUD_LOGGING_ONLY"
+        retention_days: 30 # minimum allowed (30-730)

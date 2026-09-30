@@ -1,0 +1,8 @@
+# Test fixture: two keys that resolve to the same environment (and service account) name.
+project_id: "fixture-project"
+
+environments:
+  composer-a:
+    environment_name: "composer-shared"
+  composer-b:
+    environment_name: "composer-shared"

@@ -1,0 +1,5 @@
+# Test fixture: an environment key with no value decodes to null and must use all defaults.
+project_id: "fixture-project"
+
+environments:
+  composer-null:

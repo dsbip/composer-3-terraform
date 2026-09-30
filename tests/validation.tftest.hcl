@@ -49,3 +49,39 @@ run "multi_environment_creates_three_envs" {
     error_message = "Multi-environment config should create exactly 3 environments."
   }
 }
+
+run "environment_without_value_uses_defaults" {
+  command = plan
+
+  variables {
+    config_file = "tests/fixtures/null-environment.yaml"
+  }
+
+  assert {
+    condition     = module.composer["composer-null"].image_version == "composer-3-airflow-2"
+    error_message = "An environment key with no value (null) should behave like {}."
+  }
+}
+
+run "empty_environments_map_plans_nothing" {
+  command = plan
+
+  variables {
+    config_file = "tests/fixtures/no-environments.yaml"
+  }
+
+  assert {
+    condition     = length(module.composer) == 0
+    error_message = "environments: with no entries should plan zero environments (used to tear everything down)."
+  }
+}
+
+run "rejects_resource_name_collisions" {
+  command = plan
+
+  variables {
+    config_file = "tests/fixtures/duplicate-names.yaml"
+  }
+
+  expect_failures = [output.environments]
+}

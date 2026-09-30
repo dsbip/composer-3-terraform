@@ -17,4 +17,9 @@ run "production_config_plans_successfully" {
     condition     = module.composer["composer-prod"].environment_name == "composer-prod"
     error_message = "Environment name should be 'composer-prod'."
   }
+
+  assert {
+    condition     = module.composer["composer-prod"].image_version == "composer-3-airflow-2.11.1"
+    error_message = "Production should use the image_version pinned in configs/production.yaml."
+  }
 }

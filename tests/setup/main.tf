@@ -18,18 +18,20 @@ variable "config_file" {
   type        = string
 }
 
+# Mirrors the YAML parsing in the root main.tf.
 locals {
-  raw_config = yamldecode(file("${path.root}/${var.config_file}"))
+  config_path = can(regex("^([A-Za-z]:)?[\\\\/]", var.config_file)) ? var.config_file : "${path.root}/${var.config_file}"
+  raw_config  = yamldecode(file(local.config_path))
 
   global_config = {
     project_id  = try(local.raw_config.project_id, null)
-    region      = try(local.raw_config.region, "europe-west2")
+    region      = coalesce(try(local.raw_config.region, null), "europe-west2")
     labels      = try(local.raw_config.labels, {})
     enable_apis = try(local.raw_config.enable_apis, true)
     apis        = try(local.raw_config.apis, [])
   }
 
-  environments = try(local.raw_config.environments, {})
+  environments = try({ for k, v in local.raw_config.environments : k => v }, {})
 }
 
 module "composer" {

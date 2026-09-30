@@ -1,7 +1,7 @@
 # ============================================================================
 # Private IP Configuration — Single Environment
-# Fully private: Private Service Connect, no public endpoint, Cloud NAT,
-# master authorized networks, HA resilience.
+# Composer 3 Private IP networking attached to a dedicated VPC with Cloud NAT,
+# custom Composer internal range, Airflow UI IP allow-list, high resilience.
 # ============================================================================
 
 project_id: "my-secure-project"
@@ -16,14 +16,22 @@ environments:
     environment_size: "ENVIRONMENT_SIZE_MEDIUM"
     resilience_mode: "HIGH_RESILIENCE"
 
+    # Private IP: Airflow components have no direct internet access. Their traffic is
+    # routed into the attached VPC, where Cloud NAT (below) provides controlled egress.
+    enable_private_environment: true
+    # Keep internet access for package builds so pypi_packages can come from PyPI.
+    # Set to true when packages come only from private repositories (e.g. Artifact Registry).
+    enable_private_builds_only: false
+
     labels:
       env: staging
       team: platform
 
     network:
       subnetwork_cidr: "10.20.0.0/24"
-      pods_cidr: "10.24.0.0/14"
-      services_cidr: "10.28.0.0/20"
+      # /20 used by Composer's internal components. Must not overlap ranges your DAGs
+      # need to reach (for example on-premises networks over VPN). Omit to use the default.
+      composer_internal_ipv4_cidr_block: "100.64.128.0/20"
       enable_cloud_nat: true
       tags:
         - "composer"
@@ -39,6 +47,8 @@ environments:
       pypi_packages:
         apache-airflow-providers-google: ">=10.0.0"
 
+    # HIGH_RESILIENCE: exactly 2 schedulers, >= 2 workers, >= 2 DAG processors,
+    # 0 or >= 2 triggerers.
     workloads:
       scheduler:
         cpu: 2
@@ -58,36 +68,30 @@ environments:
       triggerer:
         cpu: 0.5
         memory_gb: 1
-        count: 1
+        count: 2
       dag_processor:
         cpu: 1
         memory_gb: 2
         storage_gb: 2
-        count: 1
+        count: 2
 
-    private_environment:
-      enable_private_endpoint: true
-      cloud_sql_ipv4_cidr_block: "10.30.0.0/24"
-      web_server_ipv4_cidr_block: "10.30.1.0/24"
-      master_ipv4_cidr_block: "10.30.2.0/28"
-      cloud_composer_network_ipv4_cidr_block: "10.30.3.0/24"
-      connection_type: "PRIVATE_SERVICE_CONNECT"
+    # The Airflow UI sees the public egress address of your network, so list public ranges.
+    web_server_network_access_control:
+      allowed_ip_ranges:
+        - value: "203.0.113.0/24"
+          description: "corporate-vpn-egress"
+        - value: "198.51.100.10/32"
+          description: "bastion-host"
 
-    master_authorized_networks:
-      enabled: true
-      cidr_blocks:
-        - display_name: "corporate-vpn"
-          cidr_block: "10.0.0.0/8"
-        - display_name: "bastion-host"
-          cidr_block: "10.20.0.10/32"
-
+    # 4 hours on Friday, Saturday and Sunday = the 12 hours/week Composer requires.
     maintenance_window:
       start_time: "2024-01-01T01:00:00Z"
       end_time: "2024-01-01T05:00:00Z"
-      recurrence: "FREQ=WEEKLY;BYDAY=SU"
+      recurrence: "FREQ=WEEKLY;BYDAY=FR,SA,SU"
 
     recovery:
       enable_scheduled_snapshots: true
-      snapshot_location: "europe-west1"
+      # Existing bucket folder, writable by the environment's service account.
+      snapshot_location: "gs://my-secure-project-composer-snapshots/composer-private"
       snapshot_creation_schedule: "0 2 * * *"
-      time_zone: "Europe/London"
+      time_zone: "UTC"

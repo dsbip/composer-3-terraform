@@ -1,7 +1,7 @@
 # ============================================================================
 # Production Configuration — Single Environment
-# Full-featured: HA, CMEK, Cloud NAT, DAG processor, scheduled snapshots,
-# data retention, master authorized networks.
+# Full-featured: Private IP, high resilience, CMEK, Cloud NAT, DAG processor,
+# scheduled snapshots, metadata retention, Airflow UI IP allow-list.
 # ============================================================================
 
 project_id: "my-prod-project"
@@ -14,7 +14,15 @@ labels:
 environments:
   composer-prod:
     environment_size: "ENVIRONMENT_SIZE_LARGE"
+    # HIGH_RESILIENCE requires exactly 2 schedulers, >= 2 workers, >= 2 DAG processors
+    # and 0 or >= 2 triggerers (see workloads below).
     resilience_mode: "HIGH_RESILIENCE"
+
+    # Private IP: Airflow components have no direct internet access; their traffic is
+    # routed into the attached VPC (Cloud NAT below). Package builds keep internet access
+    # so pypi_packages can be installed from PyPI.
+    enable_private_environment: true
+    enable_private_builds_only: false
 
     labels:
       env: production
@@ -24,10 +32,6 @@ environments:
       name: "composer-prod-network"
       subnetwork_name: "composer-prod-subnet"
       subnetwork_cidr: "10.0.0.0/24"
-      pods_range_name: "composer-pods"
-      pods_cidr: "10.4.0.0/14"
-      services_range_name: "composer-services"
-      services_cidr: "10.8.0.0/20"
       enable_cloud_nat: true
       tags:
         - "composer"
@@ -45,7 +49,11 @@ environments:
         - "roles/secretmanager.secretAccessor"
 
     software_config:
-      image_version: "composer-3-airflow-2.10.2"
+      # Pins the Airflow version; the newest build of it is picked at creation time.
+      # For a fully reproducible environment pin a build instead, e.g.
+      # composer-3-airflow-2.11.1-build.19 (list the available ones with
+      # gcloud composer environments list-image-versions --location=us-central1).
+      image_version: "composer-3-airflow-2.11.1"
       airflow_config_overrides:
         core-dags_are_paused_at_creation: "True"
         core-max_active_runs_per_dag: "5"
@@ -65,7 +73,7 @@ environments:
 
     workloads:
       scheduler:
-        cpu: 4
+        cpu: 2 # Composer 3 schedulers take 0.5-2 vCPU
         memory_gb: 8
         storage_gb: 10
         count: 2
@@ -89,26 +97,19 @@ environments:
         storage_gb: 5
         count: 2
 
-    private_environment:
-      enable_private_endpoint: false
-      cloud_sql_ipv4_cidr_block: "10.10.0.0/24"
-      web_server_ipv4_cidr_block: "10.10.1.0/24"
-      master_ipv4_cidr_block: "10.10.2.0/28"
-      cloud_composer_network_ipv4_cidr_block: "10.10.3.0/24"
-      connection_type: "VPC_PEERING"
+    # Only these source ranges can reach the Airflow UI.
+    web_server_network_access_control:
+      allowed_ip_ranges:
+        - value: "203.0.113.0/24"
+          description: "office-vpn"
+        - value: "198.51.100.0/24"
+          description: "cicd-runners"
 
-    master_authorized_networks:
-      enabled: true
-      cidr_blocks:
-        - display_name: "office-vpn"
-          cidr_block: "203.0.113.0/24"
-        - display_name: "cicd-runners"
-          cidr_block: "198.51.100.0/24"
-
+    # 4 hours on Friday, Saturday and Sunday = the 12 hours/week Composer requires.
     maintenance_window:
       start_time: "2024-01-01T02:00:00Z"
       end_time: "2024-01-01T06:00:00Z"
-      recurrence: "FREQ=WEEKLY;BYDAY=SU"
+      recurrence: "FREQ=WEEKLY;BYDAY=FR,SA,SU"
 
     encryption:
       enable_cmek: true
@@ -118,13 +119,13 @@ environments:
 
     recovery:
       enable_scheduled_snapshots: true
-      snapshot_location: "us-central1"
+      # Existing bucket folder, writable by the environment's service account.
+      snapshot_location: "gs://my-prod-project-composer-snapshots/composer-prod"
       snapshot_creation_schedule: "0 3 * * *"
-      time_zone: "America/Chicago"
+      # Fixed UTC offset (US Central standard time); DST is not applied.
+      time_zone: "UTC-06"
 
     data_retention:
       airflow_metadata_retention_config:
         retention_mode: "RETENTION_MODE_ENABLED"
         retention_days: 90
-      task_logs_retention_config:
-        storage_mode: "CLOUD_LOGGING_AND_CLOUD_STORAGE"

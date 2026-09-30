@@ -1,0 +1,4 @@
+# Test fixture: an empty environments map plans nothing (how every environment is removed).
+project_id: "fixture-project"
+
+environments:

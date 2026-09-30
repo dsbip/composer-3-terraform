@@ -13,7 +13,7 @@ labels:
 
 environments:
 
-  # ── Dev: minimal, cost-optimised ─────────────────────────────────────
+  # ── Dev: minimal, cost-optimised, Public IP ──────────────────────────
   composer-dev:
     labels:
       env: dev
@@ -21,17 +21,17 @@ environments:
       env_variables:
         ENVIRONMENT: "dev"
 
-  # ── Staging: medium, private, with triggerer ─────────────────────────
+  # ── Staging: medium, Private IP + Cloud NAT, with triggerer ──────────
   composer-staging:
     environment_size: "ENVIRONMENT_SIZE_MEDIUM"
+    enable_private_environment: true
+    enable_private_builds_only: false # builds may reach PyPI
 
     labels:
       env: staging
 
     network:
       subnetwork_cidr: "10.10.0.0/24"
-      pods_cidr: "10.11.0.0/16"
-      services_cidr: "10.12.0.0/20"
       enable_cloud_nat: true
 
     software_config:
@@ -52,30 +52,27 @@ environments:
         max_count: 6
       triggerer:
         cpu: 0.5
-        memory_gb: 0.5
+        memory_gb: 1
         count: 1
 
-    private_environment:
-      enable_private_endpoint: false
-      cloud_sql_ipv4_cidr_block: "10.13.0.0/24"
-
+    # 4 hours on Wednesday, Saturday and Sunday = 12 hours/week.
     maintenance_window:
       start_time: "2024-01-01T04:00:00Z"
       end_time: "2024-01-01T08:00:00Z"
-      recurrence: "FREQ=WEEKLY;BYDAY=SA"
+      recurrence: "FREQ=WEEKLY;BYDAY=WE,SA,SU"
 
-  # ── Prod: large, HA, CMEK, full workloads ────────────────────────────
+  # ── Prod: large, HA, Private IP, CMEK, full workloads ────────────────
   composer-prod:
     environment_size: "ENVIRONMENT_SIZE_LARGE"
     resilience_mode: "HIGH_RESILIENCE"
+    enable_private_environment: true
+    enable_private_builds_only: false
 
     labels:
       env: production
 
     network:
       subnetwork_cidr: "10.20.0.0/24"
-      pods_cidr: "10.21.0.0/14"
-      services_cidr: "10.25.0.0/20"
       enable_cloud_nat: true
       tags:
         - "composer"
@@ -105,7 +102,7 @@ environments:
 
     workloads:
       scheduler:
-        cpu: 4
+        cpu: 2 # Composer 3 schedulers take 0.5-2 vCPU
         memory_gb: 8
         storage_gb: 10
         count: 2
@@ -129,13 +126,6 @@ environments:
         storage_gb: 5
         count: 2
 
-    private_environment:
-      enable_private_endpoint: false
-      cloud_sql_ipv4_cidr_block: "10.26.0.0/24"
-      web_server_ipv4_cidr_block: "10.26.1.0/24"
-      master_ipv4_cidr_block: "10.26.2.0/28"
-      cloud_composer_network_ipv4_cidr_block: "10.26.3.0/24"
-
     encryption:
       enable_cmek: true
       kms_key_ring_name: "composer-prod-keyring"
@@ -144,16 +134,15 @@ environments:
     maintenance_window:
       start_time: "2024-01-01T02:00:00Z"
       end_time: "2024-01-01T06:00:00Z"
-      recurrence: "FREQ=WEEKLY;BYDAY=SU"
+      recurrence: "FREQ=WEEKLY;BYDAY=FR,SA,SU"
 
     recovery:
       enable_scheduled_snapshots: true
+      snapshot_location: "gs://my-gcp-project-composer-snapshots/composer-prod"
       snapshot_creation_schedule: "0 3 * * *"
-      time_zone: "Europe/London"
+      time_zone: "UTC"
 
     data_retention:
       airflow_metadata_retention_config:
         retention_mode: "RETENTION_MODE_ENABLED"
         retention_days: 90
-      task_logs_retention_config:
-        storage_mode: "CLOUD_LOGGING_AND_CLOUD_STORAGE"

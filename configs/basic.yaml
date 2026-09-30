@@ -1,7 +1,8 @@
 # ============================================================================
 # Basic Configuration — Single Environment
 # Minimal YAML: just project_id and an environment key.
-# Everything else uses module defaults.
+# Everything else uses module defaults (Composer 3 image composer-3-airflow-2,
+# europe-west2, ENVIRONMENT_SIZE_SMALL, Public IP, dedicated VPC and SA).
 # ============================================================================
 
 project_id: "my-gcp-project"

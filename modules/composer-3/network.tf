@@ -1,3 +1,8 @@
+# Composer 3 runs its infrastructure in a Google-managed tenant project. Attaching it to a
+# VPC makes Composer create a Private Service Connect network attachment in the subnet, which
+# uses IPs from the subnet's primary range. No GKE secondary ranges or Composer-specific
+# firewall rules are needed (those were Composer 2 requirements).
+
 # ── VPC Network ────────────────────────────────────────────────────────
 resource "google_compute_network" "composer" {
   count = local.network.create ? 1 : 0
@@ -9,7 +14,7 @@ resource "google_compute_network" "composer" {
   depends_on = [google_project_service.required]
 }
 
-# ── Subnetwork with secondary ranges for pods/services ─────────────────
+# ── Subnetwork (hosts the Composer network attachment) ─────────────────
 resource "google_compute_subnetwork" "composer" {
   count = local.network.create ? 1 : 0
 
@@ -18,16 +23,6 @@ resource "google_compute_subnetwork" "composer" {
   region        = local.region
   network       = google_compute_network.composer[0].id
   ip_cidr_range = local.network.subnetwork_cidr
-
-  secondary_ip_range {
-    range_name    = local.network.pods_range_name
-    ip_cidr_range = local.network.pods_cidr
-  }
-
-  secondary_ip_range {
-    range_name    = local.network.services_range_name
-    ip_cidr_range = local.network.services_cidr
-  }
 
   private_ip_google_access = true
 }
@@ -42,7 +37,9 @@ resource "google_compute_router" "composer" {
   network = google_compute_network.composer[0].id
 }
 
-# ── Cloud NAT (outbound internet for private environments) ─────────────
+# ── Cloud NAT (outbound internet for traffic routed through the VPC) ───
+# A Private IP environment attached to this VPC sends its traffic into the VPC, so NAT
+# is what gives its Airflow components internet access.
 resource "google_compute_router_nat" "composer" {
   count = local.network.create && local.network.enable_cloud_nat ? 1 : 0
 
@@ -57,51 +54,4 @@ resource "google_compute_router_nat" "composer" {
     enable = true
     filter = "ERRORS_ONLY"
   }
-}
-
-# ── Firewall: allow internal traffic between Composer components ───────
-resource "google_compute_firewall" "composer_internal" {
-  count = local.network.create ? 1 : 0
-
-  project = local.project_id
-  name    = "${local.environment_name}-allow-internal"
-  network = google_compute_network.composer[0].id
-
-  allow {
-    protocol = "tcp"
-  }
-  allow {
-    protocol = "udp"
-  }
-  allow {
-    protocol = "icmp"
-  }
-
-  source_ranges = [
-    local.network.subnetwork_cidr,
-    local.network.pods_cidr,
-    local.network.services_cidr,
-  ]
-
-  target_tags = local.network.tags
-}
-
-# ── Firewall: allow health checks from GCP load balancer ranges ───────
-resource "google_compute_firewall" "composer_health_checks" {
-  count = local.network.create ? 1 : 0
-
-  project = local.project_id
-  name    = "${local.environment_name}-allow-health-checks"
-  network = google_compute_network.composer[0].id
-
-  allow {
-    protocol = "tcp"
-  }
-
-  source_ranges = [
-    "35.191.0.0/16",
-    "130.211.0.0/22",
-  ]
-
-  target_tags = local.network.tags
 }
