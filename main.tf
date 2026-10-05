@@ -9,6 +9,8 @@ locals {
     labels      = try(local.raw_config.labels, {})
     enable_apis = try(local.raw_config.enable_apis, true)
     apis        = try(local.raw_config.apis, [])
+    # Per-environment values override this; null = the module default (true).
+    create_composer_environment = try(local.raw_config.create_composer_environment, null)
   }
 
   # `environments:` with no entries decodes to null.

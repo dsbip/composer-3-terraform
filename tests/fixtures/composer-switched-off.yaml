@@ -1,0 +1,12 @@
+# Test fixture: the global create_composer_environment switches every environment off unless
+# the environment overrides it. Supporting infrastructure is planned for both.
+project_id: "fixture-project"
+create_composer_environment: false
+
+environments:
+  composer-off:
+    network:
+      enable_cloud_nat: true
+
+  composer-on:
+    create_composer_environment: true

@@ -77,6 +77,7 @@ WORKLOAD_KEYS = {
 ENV_SCHEMA = {
     "environment_name": None, "project_id": None, "region": None, "environment_size": None,
     "resilience_mode": None, "labels": "any", "enable_apis": None, "apis": None,
+    "create_composer_environment": None,
     "enable_private_environment": None, "enable_private_builds_only": None,
     "network": {"create", "name", "subnetwork_name", "subnetwork_cidr", "existing_network",
                 "existing_subnetwork", "existing_network_attachment",
@@ -92,12 +93,26 @@ ENV_SCHEMA = {
     "data_retention": {"airflow_metadata_retention_config"},
     "storage": {"bucket"},
 }
-TOP_LEVEL_KEYS = {"project_id", "region", "labels", "enable_apis", "apis", "environments"}
+TOP_LEVEL_KEYS = {"project_id", "region", "labels", "enable_apis", "apis", "create_composer_environment",
+                  "environments"}
 
 
 def mapping(value):
     """Return value if it is a dict, {} for None/anything else (mirrors try(..., {}) in HCL)."""
     return value if isinstance(value, dict) else {}
+
+
+def is_tf_bool(value):
+    """True for values Terraform's tobool() accepts: booleans and the strings "true"/"false"."""
+    return isinstance(value, bool) or value in ("true", "false")
+
+
+def composer_environment_created(env, glob_cfg):
+    """Effective create_composer_environment (per-env > global > true), as the module resolves it.
+    An invalid value counts as true there, so that the environment's precondition reports it."""
+    value = first(env.get("create_composer_environment"), glob_cfg.get("create_composer_environment"), True)
+    # `is False`, not `== False`: 0 == False in Python, but 0 is invalid (so true) for the module.
+    return not (value is False or value == "false")
 
 
 def first(*values):
@@ -167,6 +182,12 @@ def check_environment(env_key, env, glob_cfg, errors, warnings):
         e("no project_id: set it at the top of the file or in this environment")
     if not GCE_NAME_RE.match(str(name)):
         e(f"environment name '{name}' must be 1-63 lowercase letters, digits or hyphens, start with a letter and not end with a hyphen")
+
+    # ── Composer environment on/off (the rest is checked either way, like the module does) ──
+    for scope, value in (("", env.get("create_composer_environment")),
+                         ("global ", glob_cfg.get("create_composer_environment"))):
+        if value is not None and not is_tf_bool(value):
+            e(f"{scope}create_composer_environment must be true or false; got {value!r}")
 
     # ── Composer 2 settings ──
     if env.get("private_environment") is not None:
@@ -416,7 +437,7 @@ def validate_file(path):
     if cfg.get("project_id") is None:
         warnings.append("no global project_id; every environment must set its own")
 
-    glob_cfg = {k: cfg.get(k) for k in ("project_id", "region", "labels")}
+    glob_cfg = {k: cfg.get(k) for k in ("project_id", "region", "labels", "create_composer_environment")}
     envs = cfg.get("environments")
     if envs is None or envs == {}:
         warnings.append("no environments defined; terraform would plan (or destroy down to) zero environments")
@@ -431,7 +452,9 @@ def validate_file(path):
     for rid, keys in seen.items():
         if len(keys) > 1:
             errors.append(f"[{', '.join(keys)}] would all create {rid}")
-    return errors, warnings, list(envs.keys())
+    names = [str(k) if composer_environment_created(mapping(v), glob_cfg) else f"{k} [switched off]"
+             for k, v in envs.items()]
+    return errors, warnings, names
 
 
 def main(argv):

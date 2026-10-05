@@ -27,30 +27,30 @@ run "empty_config_uses_composer_3_defaults" {
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].software_config[0].image_version == "composer-3-airflow-2"
+    condition     = google_composer_environment.this[0].config[0].software_config[0].image_version == "composer-3-airflow-2"
     error_message = "Default image must be the composer-3-airflow-2 alias."
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].environment_size == "ENVIRONMENT_SIZE_SMALL"
+    condition     = google_composer_environment.this[0].config[0].environment_size == "ENVIRONMENT_SIZE_SMALL"
     error_message = "Default size should be ENVIRONMENT_SIZE_SMALL."
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].workloads_config[0].scheduler[0].count == 1
+    condition     = google_composer_environment.this[0].config[0].workloads_config[0].scheduler[0].count == 1
     error_message = "Standard resilience should default to 1 scheduler."
   }
 
   assert {
     condition = (
-      google_composer_environment.this.config[0].workloads_config[0].worker[0].min_count == 1 &&
-      google_composer_environment.this.config[0].workloads_config[0].worker[0].max_count == 3
+      google_composer_environment.this[0].config[0].workloads_config[0].worker[0].min_count == 1 &&
+      google_composer_environment.this[0].config[0].workloads_config[0].worker[0].max_count == 3
     )
     error_message = "Workers should default to autoscaling between 1 and 3."
   }
 
   assert {
-    condition     = length(google_composer_environment.this.config[0].workloads_config[0].triggerer) == 0 && length(google_composer_environment.this.config[0].workloads_config[0].dag_processor) == 0
+    condition     = length(google_composer_environment.this[0].config[0].workloads_config[0].triggerer) == 0 && length(google_composer_environment.this[0].config[0].workloads_config[0].dag_processor) == 0
     error_message = "triggerer and dag_processor should only be configured when present in YAML."
   }
 
@@ -80,12 +80,12 @@ run "empty_config_uses_composer_3_defaults" {
   }
 
   assert {
-    condition     = google_composer_environment.this.labels == tomap({ managed_by = "terraform" })
+    condition     = google_composer_environment.this[0].labels == tomap({ managed_by = "terraform" })
     error_message = "Global labels should be applied."
   }
 
   assert {
-    condition     = google_composer_environment.this.region == "europe-west2" && google_composer_environment.this.project == "unit-project"
+    condition     = google_composer_environment.this[0].region == "europe-west2" && google_composer_environment.this[0].project == "unit-project"
     error_message = "Region and project should come from global_config."
   }
 }
@@ -108,22 +108,22 @@ run "high_resilience_adjusts_workload_defaults" {
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].workloads_config[0].scheduler[0].count == 2
+    condition     = google_composer_environment.this[0].config[0].workloads_config[0].scheduler[0].count == 2
     error_message = "HIGH_RESILIENCE should default to exactly 2 schedulers."
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].workloads_config[0].worker[0].min_count == 2
+    condition     = google_composer_environment.this[0].config[0].workloads_config[0].worker[0].min_count == 2
     error_message = "HIGH_RESILIENCE should default to at least 2 workers."
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].workloads_config[0].triggerer[0].count == 2
+    condition     = google_composer_environment.this[0].config[0].workloads_config[0].triggerer[0].count == 2
     error_message = "HIGH_RESILIENCE should default the triggerer count to 2."
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].workloads_config[0].dag_processor[0].count == 2
+    condition     = google_composer_environment.this[0].config[0].workloads_config[0].dag_processor[0].count == 2
     error_message = "HIGH_RESILIENCE should default the DAG processor count to 2."
   }
 }
@@ -146,12 +146,12 @@ run "private_ip_environment_with_cloud_nat" {
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].enable_private_environment == true
+    condition     = google_composer_environment.this[0].config[0].enable_private_environment == true
     error_message = "enable_private_environment should be passed through."
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].enable_private_builds_only == false
+    condition     = google_composer_environment.this[0].config[0].enable_private_builds_only == false
     error_message = "enable_private_builds_only should be passed through."
   }
 
@@ -183,12 +183,12 @@ run "existing_network_attachment_skips_vpc_creation" {
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].node_config[0].composer_network_attachment == "projects/unit-project/regions/europe-west2/networkAttachments/composer"
+    condition     = google_composer_environment.this[0].config[0].node_config[0].composer_network_attachment == "projects/unit-project/regions/europe-west2/networkAttachments/composer"
     error_message = "The network attachment should be passed to node_config."
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].node_config[0].composer_internal_ipv4_cidr_block == "100.64.128.0/20"
+    condition     = google_composer_environment.this[0].config[0].node_config[0].composer_internal_ipv4_cidr_block == "100.64.128.0/20"
     error_message = "composer_internal_ipv4_cidr_block should be passed to node_config."
   }
 }
@@ -244,7 +244,7 @@ run "existing_service_account_from_another_project" {
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].node_config[0].service_account == "shared-composer@other-project.iam.gserviceaccount.com"
+    condition     = google_composer_environment.this[0].config[0].node_config[0].service_account == "shared-composer@other-project.iam.gserviceaccount.com"
     error_message = "The environment should run as the existing SA."
   }
 }
@@ -302,7 +302,7 @@ run "existing_kms_key_implies_cmek" {
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].encryption_config[0].kms_key_name == "projects/unit-project/locations/europe-west2/keyRings/ring/cryptoKeys/key"
+    condition     = google_composer_environment.this[0].config[0].encryption_config[0].kms_key_name == "projects/unit-project/locations/europe-west2/keyRings/ring/cryptoKeys/key"
     error_message = "The existing key should be used without setting enable_cmek."
   }
 }
@@ -326,7 +326,7 @@ run "web_server_access_control_is_rendered" {
   }
 
   assert {
-    condition     = length(google_composer_environment.this.config[0].web_server_network_access_control[0].allowed_ip_range) == 2
+    condition     = length(google_composer_environment.this[0].config[0].web_server_network_access_control[0].allowed_ip_range) == 2
     error_message = "Both allowed IP ranges should be rendered."
   }
 }
@@ -352,18 +352,18 @@ run "recovery_and_retention_are_rendered" {
 
   assert {
     condition = (
-      google_composer_environment.this.config[0].recovery_config[0].scheduled_snapshots_config[0].enabled == true &&
-      google_composer_environment.this.config[0].recovery_config[0].scheduled_snapshots_config[0].snapshot_location == "gs://unit-bucket/snapshots" &&
-      google_composer_environment.this.config[0].recovery_config[0].scheduled_snapshots_config[0].snapshot_creation_schedule == "0 3 * * *" &&
-      google_composer_environment.this.config[0].recovery_config[0].scheduled_snapshots_config[0].time_zone == "UTC+01"
+      google_composer_environment.this[0].config[0].recovery_config[0].scheduled_snapshots_config[0].enabled == true &&
+      google_composer_environment.this[0].config[0].recovery_config[0].scheduled_snapshots_config[0].snapshot_location == "gs://unit-bucket/snapshots" &&
+      google_composer_environment.this[0].config[0].recovery_config[0].scheduled_snapshots_config[0].snapshot_creation_schedule == "0 3 * * *" &&
+      google_composer_environment.this[0].config[0].recovery_config[0].scheduled_snapshots_config[0].time_zone == "UTC+01"
     )
     error_message = "Scheduled snapshots should be enabled with the given location/time zone and the default schedule."
   }
 
   assert {
     condition = (
-      google_composer_environment.this.config[0].data_retention_config[0].airflow_metadata_retention_config[0].retention_mode == "RETENTION_MODE_ENABLED" &&
-      google_composer_environment.this.config[0].data_retention_config[0].airflow_metadata_retention_config[0].retention_days == 30
+      google_composer_environment.this[0].config[0].data_retention_config[0].airflow_metadata_retention_config[0].retention_mode == "RETENTION_MODE_ENABLED" &&
+      google_composer_environment.this[0].config[0].data_retention_config[0].airflow_metadata_retention_config[0].retention_days == 30
     )
     error_message = "Metadata retention should default to enabled with 30 days."
   }
@@ -386,7 +386,7 @@ run "data_lineage_enables_its_api" {
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].software_config[0].cloud_data_lineage_integration[0].enabled == true
+    condition     = google_composer_environment.this[0].config[0].software_config[0].cloud_data_lineage_integration[0].enabled == true
     error_message = "cloud_data_lineage_integration should be rendered."
   }
 
@@ -396,7 +396,7 @@ run "data_lineage_enables_its_api" {
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].software_config[0].web_server_plugins_mode == "DISABLED"
+    condition     = google_composer_environment.this[0].config[0].software_config[0].web_server_plugins_mode == "DISABLED"
     error_message = "web_server_plugins_mode should be passed through."
   }
 }
@@ -419,17 +419,17 @@ run "labels_merge_and_null_values_fall_back" {
   }
 
   assert {
-    condition     = google_composer_environment.this.labels == tomap({ managed_by = "yaml", cost = "1234" })
+    condition     = google_composer_environment.this[0].labels == tomap({ managed_by = "yaml", cost = "1234" })
     error_message = "Per-env labels should win over global labels and be stringified."
   }
 
   assert {
-    condition     = google_composer_environment.this.region == "europe-west2"
+    condition     = google_composer_environment.this[0].region == "europe-west2"
     error_message = "An explicit null region should fall back to the global region."
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].software_config[0].pypi_packages["pandas"] == ""
+    condition     = google_composer_environment.this[0].config[0].software_config[0].pypi_packages["pandas"] == ""
     error_message = "A PyPI package without a version should be installed unpinned."
   }
 }
@@ -466,7 +466,7 @@ run "airflow_3_raises_triggerer_default_memory" {
   }
 
   assert {
-    condition     = google_composer_environment.this.config[0].workloads_config[0].triggerer[0].memory_gb == 2
+    condition     = google_composer_environment.this[0].config[0].workloads_config[0].triggerer[0].memory_gb == 2
     error_message = "Airflow 3 needs at least 2 GB per triggerer, so the default should follow the image."
   }
 }

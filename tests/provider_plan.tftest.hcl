@@ -93,6 +93,30 @@ run "multi_environment_config" {
   }
 }
 
+# One environment switched off (only its supporting infrastructure is planned), one on.
+run "composer_environment_switched_off" {
+  command = plan
+
+  variables {
+    config_file = "tests/fixtures/composer-switched-off.yaml"
+  }
+
+  override_data {
+    target = module.composer["composer-off"].data.google_project.this
+    values = { number = "123456789012" }
+  }
+
+  override_data {
+    target = module.composer["composer-on"].data.google_project.this
+    values = { number = "123456789012" }
+  }
+
+  assert {
+    condition     = output.environments["composer-off"].composer_environment_created == false && output.environments["composer-on"].composer_environment_created == true
+    error_message = "Only composer-on should get a Composer environment."
+  }
+}
+
 # Composer 3-only fields not used by the sample configs.
 run "composer_3_only_fields" {
   command = plan

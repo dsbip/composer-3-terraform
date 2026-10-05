@@ -1,6 +1,9 @@
 resource "google_composer_environment" "this" {
   provider = google-beta
 
+  # create_composer_environment: false deletes (or never creates) only this resource.
+  count = local.create_composer_environment ? 1 : 0
+
   project = local.project_id
   name    = local.environment_name
   region  = local.region
@@ -142,10 +145,11 @@ resource "google_composer_environment" "this" {
   }
 
   lifecycle {
-    # All configuration checks from validation.tf, reported together.
+    # All configuration checks from validation.tf, reported together. While the environment
+    # is switched off, the composer_environment_created output runs the same check instead.
     precondition {
-      condition     = length(local.validation_errors) == 0
-      error_message = "Invalid configuration for Composer environment \"${var.environment_key}\":\n  - ${join("\n  - ", local.validation_errors)}"
+      condition     = local.configuration_valid
+      error_message = local.validation_error_message
     }
   }
 
@@ -158,4 +162,11 @@ resource "google_composer_environment" "this" {
     google_compute_subnetwork.composer,
     google_compute_router_nat.composer,
   ]
+}
+
+# The environment gained count (create_composer_environment). Existing environments move to
+# [0] instead of being replaced. Terraform would do this implicitly too; the block makes it explicit.
+moved {
+  from = google_composer_environment.this
+  to   = google_composer_environment.this[0]
 }

@@ -7,6 +7,13 @@ locals {
   project_id       = try(coalesce(try(var.config.project_id, null), try(var.global_config.project_id, null)), null)
   region           = coalesce(try(var.config.region, null), try(var.global_config.region, null), "europe-west2")
 
+  # ── Composer environment on/off ─────────────────────────────────────
+  # false removes only google_composer_environment.this; the network, NAT, service account,
+  # IAM, KMS and APIs stay managed. An invalid value counts as true here so that the
+  # environment's precondition can report it (validation.tf).
+  create_composer_environment_raw = try(coalesce(try(var.config.create_composer_environment, null), try(var.global_config.create_composer_environment, null)), true)
+  create_composer_environment     = try(tobool(local.create_composer_environment_raw), true)
+
   # ── Labels (global merged with per-env; per-env wins) ───────────────
   labels = {
     for k, v in merge(

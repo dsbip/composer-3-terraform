@@ -14,7 +14,7 @@ Terraform module for deploying one or more Google Cloud Composer 3 environments 
 - The root `environments` output has a precondition rejecting two environments that would create the same named resource (built from each module's `managed_resource_ids` output)
 
 ### Global → per-environment config merging
-- `project_id`, `region`, `enable_apis`, `apis` resolve as: per-env > global > hardcoded default
+- `project_id`, `region`, `enable_apis`, `apis`, `create_composer_environment` resolve as: per-env > global > hardcoded default
 - `labels` are merged (global + per-env, per-env wins on conflicts) and stringified
 - Values are read with `coalesce(try(var.config.x, null), default)` so an explicit YAML null (`region:`) behaves like an omitted key
 - This keeps the YAML DRY — define once at top, override only where needed
@@ -35,9 +35,18 @@ Terraform module for deploying one or more Google Cloud Composer 3 environments 
 - **DAG Processor**: configured only when `workloads.dag_processor` is present; otherwise GCP sizes it (Composer 3 always runs one)
 - **Private IP** (`enable_private_environment`, `enable_private_builds_only`), **Airflow UI allow-list** (`web_server_network_access_control`), **maintenance window**, **encryption**, **recovery**, **data retention**, **data lineage**, **network attachment / internal /20**: all omitted unless configured
 
+### Composer environment on/off (`create_composer_environment`)
+- `count` on `google_composer_environment.this` only — no supporting resource (network, NAT, SA, IAM, KMS, APIs, service identity) may depend on the flag or reference the environment resource
+- Resolved per-env > global > `true` with `coalesce`, then `try(tobool(...), true)`: an invalid value counts as `true` so the resource exists and its precondition reports it
+- Outputs read the environment with `one(google_composer_environment.this[*].x)` (null while off), never `this[0]`
+- While off, the `composer_environment_created` output's precondition runs the same validation (the resource and its precondition don't exist) — keep both
+- The environment name stays in `managed_resource_ids` while off, so re-enabling can't collide
+- `moved { this → this[0] }` in `main.tf` keeps environments created before `count` existed (Terraform also does this implicitly)
+
 ### Validation layer (`modules/composer-3/validation.tf`)
 - The provider skips validation of everything nested under `config` while any value there is unknown at plan time — always true here (network/SA created in the same run). So invalid nested values would only fail at apply, after other resources exist
-- `validation.tf` builds `validation_checks` (`{ ok, message }` list); one precondition on `google_composer_environment.this` reports every failure, naming the environment
+- `validation.tf` builds `validation_checks` (`{ ok, message }` list) and `workload_checks`; one precondition on `google_composer_environment.this` (or, while it is switched off, on the `composer_environment_created` output) reports every failure, naming the environment
+- Preconditions test `local.configuration_valid`, which is derived from `local.validation_error_message`: Terraform 1.2/1.3 order an output after what its precondition's *condition* references but not its `error_message`, so a message local referenced only in `error_message` may be unevaluated (1.2.7 printed "Failed to evaluate condition error message."). Resource preconditions don't have this problem
 - **Expressions must be null-safe on Terraform 1.2**: it does not short-circuit `||`/`&&`, so `x == null || contains(list, x)` still errors. Wrap the right side in `try()`/`can()`, use `jsonencode()` in messages. Terraform 1.16 short-circuits, so tests alone won't catch this — evaluate with 1.2 (`terraform console -var-file=...` in a copy of the module)
 - Rejects Composer 2 keys (`private_environment`, `master_authorized_networks`, `network.pods_*`/`services_*`, `data_retention.task_logs_retention_config`) with the replacement named
 - `workload_limits` encodes Composer 3's per-component limits (Scale environments docs): counts, vCPU range/step, memory range (higher minimum on Airflow 3 images), 1–8 GB per vCPU, storage 0–100
@@ -112,7 +121,9 @@ Full field reference: `usage.md` → "Complete YAML Input Definition". It is gen
 - `terraform test` (Terraform >= 1.7 for `mock_provider`):
   - `basic`, `production`, `validation` — root module with mocks; `validation` also covers `tests/fixtures/*.yaml`
   - `module.tftest.hcl` — child module via `module { source = "./modules/composer-3" }`; one `expect_failures` run per validation rule
+  - `create_composer_environment.tftest.hcl` — child module; plan runs for the flag plus `command = apply` runs (on → off → on) sharing state. Apply with mocks needs realistic `defaults` for values the provider format-checks (SA name/email/member, GCS agent member) and a fixed `google_project.number` (a random one per run makes IAM members look changed). Mocks never force replacements, so unchanged IDs only rule out Terraform-level recreation
   - `provider_plan.tftest.hcl` — **real** providers, offline (fake `access_token`, `override_data` for `data.google_project.this`); the only tests that exercise the provider's CustomizeDiff rules
+  - On Windows, `-filter` takes backslash paths (`-filter=tests\module.tftest.hcl`); a failed run skips the rest of its file
 - `terraform plan` — requires GCP credentials (validates provider interaction)
 
 ## Common Gotchas
@@ -124,4 +135,5 @@ Full field reference: `usage.md` → "Complete YAML Input Definition". It is gen
 - `recovery.snapshot_location` is a `gs://` folder and `recovery.time_zone` a UTC offset (`UTC+01`), not a region / IANA name
 - Maintenance windows need ≥ 12 h per week and ≥ 4 h per slot (e.g. 4 h on `FR,SA,SU`)
 - Empty env value (`my-env: {}` or `my-env:`) is valid — all settings default
+- `create_composer_environment: false` deletes the Airflow database with the environment (snapshots and the bucket are kept); a recreated environment gets a new bucket unless `storage.bucket` is set — set it only while the environment is off (`bucket` is ForceNew)
 - Removing `roles/composer.ServiceAgentV2Ext` is intentional; Composer 2 environments in the same project must get it from elsewhere

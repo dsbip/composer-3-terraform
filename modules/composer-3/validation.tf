@@ -6,7 +6,10 @@
 # network, IAM and KMS resources already exist.
 #
 # Every failed check is reported in one precondition error on google_composer_environment.this
-# (see main.tf). Expressions must not error: older Terraform releases, including 1.2 (the minimum
+# (see main.tf). With create_composer_environment: false that resource does not exist, so the
+# composer_environment_created output (outputs.tf) reports the same error instead: the whole
+# configuration is still checked, so that switching the environment back on cannot fail at
+# apply time. Expressions must not error: older Terraform releases, including 1.2 (the minimum
 # this module supports), do not short-circuit || and &&, so the right side is evaluated even when
 # the left side already decides the result. Anything that can fail on a missing value is
 # therefore wrapped in try() or can().
@@ -51,6 +54,16 @@ locals {
   dag_processor_count = try(local.workloads.dag_processor.count, null)
 
   validation_checks = [
+    # ── Composer environment on/off ───────────────────────────────────
+    {
+      ok      = try(var.config.create_composer_environment, null) == null || can(tobool(var.config.create_composer_environment))
+      message = "create_composer_environment must be true or false; got ${jsonencode(try(var.config.create_composer_environment, null))}."
+    },
+    {
+      ok      = try(var.global_config.create_composer_environment, null) == null || can(tobool(var.global_config.create_composer_environment))
+      message = "The global create_composer_environment must be true or false; got ${jsonencode(try(var.global_config.create_composer_environment, null))}."
+    },
+
     # ── Composer 2 settings that Composer 3 rejects or ignores ─────────
     {
       ok      = try(var.config.private_environment, null) == null
@@ -293,4 +306,15 @@ locals {
   ])
 
   validation_errors = [for c in concat(local.validation_checks, local.workload_checks) : c.message if !c.ok]
+
+  validation_error_message = length(local.validation_errors) == 0 ? "" : join("", [
+    "Invalid configuration for Composer environment \"${var.environment_key}\"",
+    local.create_composer_environment ? "" : " (checked although create_composer_environment is false, so that switching it back on cannot fail)",
+    ":\n  - ${join("\n  - ", local.validation_errors)}",
+  ])
+
+  # The preconditions test this rather than validation_errors. Terraform 1.2 and 1.3 evaluate
+  # what an output precondition's condition references before the output, but not what its
+  # error_message references; deriving this from the message makes the message ready in time.
+  configuration_valid = local.validation_error_message == ""
 }

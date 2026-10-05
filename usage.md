@@ -16,6 +16,8 @@ This Terraform module deploys one or more **Google Cloud Composer 3** environmen
 
 Almost every setting has a sensible default. A minimal config needs only `project_id` and an environment key. Configuration mistakes are reported at `terraform plan` time, naming the environment and the setting (see [Validation](#validation)).
 
+Each Composer environment can be switched off and on again with `create_composer_environment`, while its network, NAT, service account and other supporting resources stay in place (see [Switching the Environment Off and On](#switching-the-environment-off-and-on)).
+
 > **Upgrading from an earlier version of this module?** Read [CHANGELOG.md](CHANGELOG.md) first: several Composer 2 settings were replaced, and the default image changed.
 
 ---
@@ -85,6 +87,7 @@ project_id: "my-gcp-project"          # REQUIRED
 region: "europe-west2"                  # Default: europe-west2
 labels:
   managed_by: terraform
+create_composer_environment: true       # Default: true (false = environments off)
 
 # ── Environments (one or more) ───────────────────────────────
 environments:
@@ -152,6 +155,14 @@ composer_environments:
                                                         "bigquery.googleapis.com").
                                                         Default: []
 
+  create_composer_environment:               [Optional] Whether the Composer environments are
+                                                        created. false deletes (or never creates)
+                                                        only the Composer environments and keeps
+                                                        their supporting infrastructure. Each
+                                                        environment can override it; see the
+                                                        per-environment field.
+                                                        Default: true
+
   labels:                                    [Optional] Key/value labels applied to all environments.
                                                         Merged with per-env labels (per-env wins on
                                                         key conflicts). Keys and values must be
@@ -177,6 +188,34 @@ composer_environments:
                                                         subnet name prefix ({key}-subnet). Must start
                                                         with a lowercase letter and contain only
                                                         lowercase letters, digits and hyphens.
+
+      ── Composer Environment On/Off ──────────────────────────────────────────────────────────────
+      (optional; affects only the Composer environment itself)
+
+          create_composer_environment:       [Optional] true = create the Composer environment, or
+                                                        keep it. false = delete it, or never create
+                                                        it, while keeping everything else this
+                                                        environment manages: the VPC, subnet, Cloud
+                                                        Router and NAT, service account, IAM
+                                                        bindings, KMS key and APIs. Set it back to
+                                                        true to recreate the environment with the
+                                                        same settings. All settings are still
+                                                        validated while it is false. Accepts
+                                                        true/false (also yes/no, or "true"/"false" in
+                                                        quotes).
+                                                        Default: inherits the global value -> true
+
+          Before switching an environment off:
+            - Its Airflow database (DAG run history, task states, and connections and variables
+              stored in Airflow) is deleted with it. To keep it, save a snapshot first and load it
+              into the recreated environment; snapshots are not deleted with the environment
+            - Its Cloud Storage bucket and Cloud Logging logs are kept (and still billed). The
+              recreated environment gets a new bucket unless storage.bucket names the old one; set
+              storage.bucket only while the environment is off (on a running environment a
+              different bucket makes Terraform recreate the environment)
+            - Outputs that describe the environment (environment_id, airflow_uri, dag_gcs_prefix,
+              gcs_bucket, image_version) are null while it is off; composer_environment_created
+              says which state it is in
 
       ── Identity & Sizing ────────────────────────────────────────────────────────────────────────
 
@@ -652,7 +691,7 @@ composer_environments:
 | Config File | Environments | Highlights |
 |---|---|---|
 | `configs/basic.yaml` | 1 (`composer-basic`) | Absolute minimum — just project_id + empty env |
-| `configs/development.yaml` | 1 (`composer-dev`) | PyPI packages, 30-day metadata retention, 12 h/week maintenance window |
+| `configs/development.yaml` | 1 (`composer-dev`) | PyPI packages, 30-day metadata retention, 12 h/week maintenance window, `create_composer_environment` example |
 | `configs/production.yaml` | 1 (`composer-prod`) | Private IP, HA, CMEK, Cloud NAT, DAG processor, snapshots, Airflow UI allow-list, pinned Airflow version |
 | `configs/private-ip.yaml` | 1 (`composer-private`) | Private IP + Cloud NAT, custom internal /20 range, Airflow UI allow-list, HA |
 | `configs/multi-environment.yaml` | 3 (`dev`, `staging`, `prod`) | Public IP dev, Private IP staging, HA + CMEK prod, shared globals |
@@ -688,7 +727,50 @@ environments:
       env: production
 ```
 
-Each environment gets its own VPC, service account, and Composer instance. The module uses `for_each` internally, so adding or removing an environment is just editing the YAML. The plan fails if two environments would create a resource with the same name (for example two keys with the same `environment_name`). `environments:` with no entries plans zero environments, which is how you remove them all.
+Each environment gets its own VPC, service account, and Composer instance. The module uses `for_each` internally, so adding or removing an environment is just editing the YAML. The plan fails if two environments would create a resource with the same name (for example two keys with the same `environment_name`). A switched-off environment keeps its name reserved, so that switching it back on cannot collide. `environments:` with no entries plans zero environments, which is how you remove them all.
+
+---
+
+## Switching the Environment Off and On
+
+`create_composer_environment: false` deletes only the Composer environment, for example to stop paying for an idle development environment. Everything else the module manages for it stays in place: the VPC, subnet, Cloud Router and NAT, service account, IAM bindings, KMS key and APIs. Setting it back to `true` recreates the environment with the same settings, attached to the same network and running as the same service account.
+
+```yaml
+create_composer_environment: true        # optional global default for every environment
+
+environments:
+  composer-dev:
+    create_composer_environment: false   # off: only this Composer environment is deleted
+  composer-prod: {}                      # inherits the global value
+```
+
+| | `true` (default) | `false` |
+|---|---|---|
+| Composer environment | created, or kept | deleted, or not created |
+| VPC, subnet, Cloud Router + NAT | managed | managed, unchanged |
+| Service account, IAM bindings | managed | managed, unchanged |
+| KMS key ring + key, key grants | managed | managed, unchanged |
+| API enablement, Composer service agent | managed | managed, unchanged |
+| Configuration checks | run | still run, so switching back on cannot fail |
+| `composer_environment_created` output | `true` | `false` |
+| `environment_id`, `airflow_uri`, `dag_gcs_prefix`, `gcs_bucket`, `image_version` outputs | set | `null` |
+
+In `terraform plan`, switching off is one resource to destroy and switching on is one resource to add:
+
+```
+  # module.composer["composer-dev"].google_composer_environment.this[0] will be destroyed
+Plan: 0 to add, 0 to change, 1 to destroy.
+```
+
+**Before switching an environment off**, know what deleting it does (Google's [delete environments](https://docs.cloud.google.com/composer/docs/composer-3/delete-environments) and [snapshots](https://docs.cloud.google.com/composer/docs/composer-3/save-load-snapshots) pages):
+
+- **The Airflow database is deleted with the environment**: DAG run history, task states, and any connections and variables stored in Airflow. To keep it, [save a snapshot](https://docs.cloud.google.com/composer/docs/composer-3/save-load-snapshots) first and load it into the recreated environment. Snapshots are not deleted with the environment, and can only be loaded into the same or a later Airflow version.
+- **The bucket and the Cloud Logging logs are kept**, and are still billed. The recreated environment gets a **new** bucket, so upload your DAGs again, or reuse the old bucket by setting `storage.bucket` to its name (the `gcs_bucket` output, before switching off). Set `storage.bucket` only while the environment is off: on a running environment, a different bucket makes Terraform recreate the environment.
+- Recreating the environment takes as long as creating it the first time.
+
+`yes`/`no` and quoted `"true"`/`"false"` are accepted too. Any other value fails the plan.
+
+Environments created by an earlier version of this module are kept when you upgrade: the first plan shows `google_composer_environment.this has moved to google_composer_environment.this[0]` and no other change for them.
 
 ---
 
@@ -734,6 +816,7 @@ Output structure per environment:
 
 | Field | Description |
 |---|---|
+| `composer_environment_created` | Whether the Composer environment exists (`create_composer_environment`) |
 | `environment_id` | Full resource ID |
 | `environment_name` | Environment name |
 | `image_version` | Composer image (the configured alias at plan time, the resolved build after apply) |
@@ -744,6 +827,8 @@ Output structure per environment:
 | `network_self_link` | VPC network self-link (null when not attached or when using a network attachment) |
 | `subnetwork_self_link` | Subnet self-link (null when not attached or when using a network attachment) |
 | `kms_key_id` | CMEK key ID (null when CMEK is off) |
+
+While an environment is switched off, `environment_id`, `image_version`, `airflow_uri`, `dag_gcs_prefix` and `gcs_bucket` are null. `environment_name` still shows the configured name, and the remaining fields are unchanged.
 
 ---
 
@@ -781,6 +866,7 @@ Output structure per environment:
     ├── production.tftest.hcl        # Production config test
     ├── validation.tftest.hcl        # All configs + YAML edge cases
     ├── module.tftest.hcl            # Child-module unit tests incl. one test per validation rule
+    ├── create_composer_environment.tftest.hcl  # Switching the environment off and on
     ├── provider_plan.tftest.hcl     # Plans every config against the real providers (offline)
     └── validate_configs.py          # Python YAML validation script
 ```
@@ -808,9 +894,10 @@ terraform test
 |---|---|---|
 | `basic.tftest.hcl` | mock | Basic config, default Composer 3 image |
 | `production.tftest.hcl` | mock | Production config |
-| `validation.tftest.hcl` | mock | Every sample config, environment with no value, empty `environments`, name collisions, non-YAML file |
+| `validation.tftest.hcl` | mock | Every sample config, environment with no value, empty `environments`, name collisions, non-YAML file, global `create_composer_environment` with a per-environment override |
+| `create_composer_environment.tftest.hcl` | mock | `create_composer_environment`: everything except the environment is still created when it is `false`, global and per-environment resolution, rejected values, validation while switched off, and an apply sequence (on → off → on) that checks the network, subnet and KMS key are kept |
 | `module.tftest.hcl` | mock | Child module: defaults, HA defaults, networking options, IAM, CMEK, rendering of every optional block, plus one failing run per validation rule |
-| `provider_plan.tftest.hcl` | **real**, offline | Plans every sample config with the real google/google-beta providers, so the provider's Composer 3 rules (which mocks skip) are exercised. Uses a fake access token and overrides the one data source read at plan time, so it needs no credentials or network access |
+| `provider_plan.tftest.hcl` | **real**, offline | Plans every sample config, and one switched-off environment, with the real google/google-beta providers, so the provider's Composer 3 rules (which mocks skip) are exercised. Uses a fake access token and overrides the one data source read at plan time, so it needs no credentials or network access |
 
 No test needs GCP credentials. `terraform plan` against a real project does.
 
@@ -824,6 +911,8 @@ terraform destroy -var 'config_file=configs/my-env.yaml'
 
 To remove one environment, delete its key from the YAML and apply. Removing every key (`environments:` with no entries) removes them all.
 
+To delete only the Composer environment and keep its network, service account and the rest, set `create_composer_environment: false` instead (see [Switching the Environment Off and On](#switching-the-environment-off-and-on)).
+
 > **Note**: CMEK keys have `prevent_destroy = true`. Remove the lifecycle block or use `terraform state rm` before full destroy.
 
 ---
@@ -832,7 +921,8 @@ To remove one environment, delete its key from the YAML and apply. Removing ever
 
 | Issue | Solution |
 |---|---|
-| `Invalid configuration for Composer environment "..."` | Fix each listed setting; every message names the field and the accepted values |
+| `Invalid configuration for Composer environment "..."` | Fix each listed setting; every message names the field and the accepted values. The check also runs while `create_composer_environment` is `false` |
+| Plan unexpectedly destroys `google_composer_environment.this[0]` | Check `create_composer_environment` for that environment and at the top of the file; `false` (or `no`) switches the environment off |
 | `Two environments in ... would create the same resource` | Give the environments distinct `environment_name`, `service_account.name`, `network.name` or `encryption.kms_key_ring_name` values |
 | `... should only be used in Composer 3` | The provider could not tell the image is Composer 3. Set `software_config.image_version` to a literal `composer-3-airflow-*` value |
 | `upgrade to composer 3 is not yet supported` | An existing Composer 2 environment cannot be moved to a Composer 3 image in place. Create a new environment under a new key, migrate, then remove the old one |

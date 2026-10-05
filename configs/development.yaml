@@ -11,6 +11,12 @@ labels:
 
 environments:
   composer-dev:
+    # Set to false to delete only the Composer environment (e.g. to stop paying for it when idle)
+    # while keeping its network, service account, IAM and APIs; set back to true to recreate it.
+    # Deleting it loses the Airflow database (DAG run history), and the recreated environment gets
+    # a new bucket unless storage.bucket is set. See usage.md, "Switching the Environment Off and On".
+    create_composer_environment: true
+
     labels:
       env: development
       team: data-engineering

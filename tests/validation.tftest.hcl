@@ -85,3 +85,30 @@ run "rejects_resource_name_collisions" {
 
   expect_failures = [output.environments]
 }
+
+run "global_create_composer_environment_with_per_environment_override" {
+  command = plan
+
+  variables {
+    config_file = "tests/fixtures/composer-switched-off.yaml"
+  }
+
+  assert {
+    condition = (
+      output.environments["composer-off"].composer_environment_created == false &&
+      output.environments["composer-off"].environment_id == null &&
+      output.environments["composer-off"].airflow_uri == null
+    )
+    error_message = "The global create_composer_environment: false should switch composer-off off."
+  }
+
+  assert {
+    condition     = output.environments["composer-on"].composer_environment_created == true
+    error_message = "composer-on overrides the global value and should be created."
+  }
+
+  assert {
+    condition     = output.environments["composer-off"].environment_name == "composer-off" && output.environments["composer-on"].environment_name == "composer-on"
+    error_message = "Both environments should still report their names."
+  }
+}

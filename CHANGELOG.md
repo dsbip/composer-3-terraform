@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-10-05 — Switch the Composer environment off and on
+
+### Added
+
+- **`create_composer_environment`** in the YAML config, globally or per environment (default `true`; the per-environment value wins). `false` deletes, or never creates, only the Composer environment. The VPC, subnet, Cloud Router and NAT, service account, IAM bindings, KMS key and APIs stay in place. Setting it back to `true` recreates the environment with the same settings. See [Switching the Environment Off and On](usage.md#switching-the-environment-off-and-on).
+- `composer_environment_created` output, in the module and in the root `environments` map.
+- Tests: `tests/create_composer_environment.tftest.hcl` (17 runs), a root-level YAML fixture run, and a real-provider plan of a switched-off environment.
+
+### Changed
+
+- `google_composer_environment.this` now has `count`, so its address is `google_composer_environment.this[0]`. Existing environments are moved to the new address, not replaced (`moved` block); no action is needed when upgrading.
+- While an environment is switched off, the outputs `environment_id`, `image_version`, `airflow_uri`, `dag_gcs_prefix`, `gcs_bucket` and `composer_environment_config` are null. `environment_name` always returns the configured name.
+- The configuration is still validated while an environment is switched off, so switching it back on cannot fail at apply time. Its name also stays reserved in the check for name collisions between environments.
+
+### Before switching an environment off
+
+Deleting a Composer environment deletes its Airflow database (DAG run history, task states, connections and variables stored in Airflow); save a [snapshot](https://docs.cloud.google.com/composer/docs/composer-3/save-load-snapshots) first to keep it. Its bucket and logs are [kept](https://docs.cloud.google.com/composer/docs/composer-3/delete-environments) and still billed, and the recreated environment gets a new bucket unless `storage.bucket` names the old one.
+
+### Verification performed
+
+- `terraform test` on 1.16.4: 87 runs, all pass.
+- Apply sequence on → off → on (mock providers): switching off plans `0 to add, 0 to change, 1 to destroy` (the environment only), switching on plans `1 to add, 0 to change, 0 to destroy`, and the network, subnet and KMS key keep their IDs throughout.
+- Upgrade: the previous version of the module (commit `4126cb2`) was applied, then this version planned against the same state. Result: `google_composer_environment.this has moved to google_composer_environment.this[0]` and `0 to add, 0 to change, 0 to destroy`. With `create_composer_environment: false`, the same upgrade destroys only the environment.
+- The new tests fail if Cloud NAT or the network is tied to the flag, or if validation is skipped while the environment is switched off. Mock providers cannot reproduce a replacement forced by the real provider; the `0 to change` plan above shows that switching changes no argument of any other resource.
+- Terraform 1.2.7 (the minimum supported version): `fmt` and `validate` pass, all 14 tested flag values evaluate as intended, and offline plans with the real providers behave as intended. Those plans covered a switched-off environment (supporting resources only), a switched-off environment with an invalid setting (the full error message is printed), a non-boolean value, the CMEK-free sample configs, and the upgrade move. For these plans, the one data source that needs the GCP API was replaced by a fixed project number in a scratch copy of the module.
+- `tests/validate_configs.py` mirrors the new checks.
+
+**Not verified:** no `terraform apply` against a real GCP project, because no credentials were available.
+
 ## 2026-10-01 — Composer 3 correctness review
 
 The module was checked against the google-beta provider it is locked to (v7.31.0), including the provider's source code for `google_composer_environment`, and against Google's current Cloud Composer 3 documentation (see [Sources](#sources)).
