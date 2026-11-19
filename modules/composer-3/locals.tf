@@ -1,13 +1,14 @@
 locals {
-  # ── Identity ─────────────────────────────────────────────────────────
-  environment_name = try(var.config.environment_name, var.environment_key)
-  project_id       = try(var.config.project_id, var.global_config.project_id)
-  region           = try(var.config.region, try(var.global_config.region, "europe-west2"))
+  # ── Identity (resolved by modules/composer-3-settings) ──────────────
+  environment_name = module.settings.environment_name
+  project_id       = module.settings.project_id
+  region           = module.settings.region
 
   # ── Labels (global merged with per-env; per-env wins) ───────────────
-  global_labels = try(var.global_config.labels, {})
-  env_labels    = try(var.config.labels, {})
-  labels        = merge(local.global_labels, local.env_labels)
+  labels = module.settings.labels
+
+  # ── Hibernation (scheduled snapshot + delete / recreate + load) ─────
+  hibernation = module.settings.hibernation
 
   # ── Environment sizing ──────────────────────────────────────────────
   environment_size = try(var.config.environment_size, "ENVIRONMENT_SIZE_SMALL")
@@ -64,8 +65,16 @@ locals {
   )
 
   # ── Software (image_version null = GCP picks latest) ────────────────
+  # An explicit YAML image_version always wins. var.fallback_image_version only
+  # fills the gap when the YAML leaves it unset — the hibernation startup
+  # script uses it to recreate an environment on the same Airflow version its
+  # snapshot was taken from.
   software_config = {
-    image_version            = try(var.config.software_config.image_version, null)
+    image_version = (
+      try(var.config.software_config.image_version, null) != null
+      ? var.config.software_config.image_version
+      : var.fallback_image_version
+    )
     airflow_config_overrides = try(var.config.software_config.airflow_config_overrides, {})
     env_variables            = try(var.config.software_config.env_variables, {})
     pypi_packages            = try(var.config.software_config.pypi_packages, {})

@@ -1,0 +1,118 @@
+# ============================================================================
+# Dev environment — Terraform plan / apply (same structure as the existing
+# pipelines/dev.yml pattern: id_tokens → Workload Identity Federation → gcs
+# backend → plan artifacts + terraform report → apply).
+#
+# Replace the placeholder values below with your project's values. The two
+# WIF settings are CI/CD variables (Settings → CI/CD → Variables), exactly as
+# in your other pipelines:
+#   GCP_DEV_WIF_PROVIDER         projects/<n>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+#   GCP_DEV_WIF_SERVICE_ACCOUNT  <deployer>@<project>.iam.gserviceaccount.com
+# ============================================================================
+
+variables:
+  DEV_PLAN: ${CI_COMMIT_REF_SLUG}-dev
+  DEV_PROJECT_ID: my-dev-project                  # TODO: your dev project
+  DEV_BUCKET: my-dev-project-tfstate-bucket       # TODO: Terraform state bucket
+  DEV_BUCKET_PREFIX: composer-3-state             # TODO: Terraform state prefix
+  DEV_CONFIG_FILE: configs/development.yaml       # YAML consumed by the module
+
+# GitLab OIDC token for Workload Identity Federation. `aud` must match the
+# audience allowed by the WIF provider (usually your GitLab URL).
+.id_tokens:
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: ${CI_SERVER_URL}
+
+# Exchanges the OIDC token for Google credentials (gcloud + Terraform).
+# Absolute paths are used so the credential file works from any directory
+# (no need to copy the token next to the Terraform code).
+.gcp_wif_auth:
+  script:
+    - mkdir -p "${CI_PROJECT_DIR}/.wif"
+    - printf '%s' "${GITLAB_OIDC_TOKEN}" > "${CI_PROJECT_DIR}/.wif/${CI_PIPELINE_ID}.git_token"
+    - gcloud iam workload-identity-pools create-cred-config ${GCP_DEV_WIF_PROVIDER}
+      --service-account="${GCP_DEV_WIF_SERVICE_ACCOUNT}"
+      --output-file="${CI_PROJECT_DIR}/.wif/${CI_PIPELINE_ID}.json"
+      --credential-source-file="${CI_PROJECT_DIR}/.wif/${CI_PIPELINE_ID}.git_token"
+    - export GOOGLE_APPLICATION_CREDENTIALS="${CI_PROJECT_DIR}/.wif/${CI_PIPELINE_ID}.json"
+    - export GOOGLE_CREDENTIALS="$(< "${GOOGLE_APPLICATION_CREDENTIALS}")"
+    - gcloud auth login --cred-file="${GOOGLE_APPLICATION_CREDENTIALS}"
+    - gcloud config set project "${DEV_PROJECT_ID}"
+
+# terraform init against the GCS backend. The module declares no backend, so
+# a (git-ignored) backend_override.tf adds one when none is declared.
+.terraform_init:
+  script:
+    - |
+      if ! grep -Eqs '^[[:space:]]*backend[[:space:]]+"' ./*.tf; then
+        printf 'terraform {\n  backend "gcs" {}\n}\n' > backend_override.tf
+      fi
+    - terraform init -input=false -reconfigure -backend-config="prefix=${DEV_BUCKET_PREFIX}" -backend-config="bucket=${DEV_BUCKET}"
+
+# GitLab's terraform report format ({create, update, delete} counts).
+.terraform_report:
+  script:
+    - |
+      convert_report() {
+        jq -r '([.resource_changes[]?.change.actions?]|flatten)|{"create":(map(select(.=="create"))|length),"update":(map(select(.=="update"))|length),"delete":(map(select(.=="delete"))|length)}'
+      }
+
+.dev_terraform_rules:
+  rules:
+    # Never run plan/apply in the scheduled hibernation pipelines.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $HIBERNATE_ACTION
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+dev-plan:
+  stage: plan
+  extends:
+    - .id_tokens
+    - .dev_terraform_rules
+  script:
+    - !reference [.gcp_wif_auth, script]
+    - !reference [.terraform_report, script]
+    - !reference [.terraform_init, script]
+    - terraform plan -input=false -var "config_file=${DEV_CONFIG_FILE}" -out=$DEV_PLAN.tfplan
+    - terraform show -no-color $DEV_PLAN.tfplan > $DEV_PLAN.txt
+    - terraform show -json -no-color $DEV_PLAN.tfplan > $DEV_PLAN.json
+    - cat $DEV_PLAN.json | convert_report > $DEV_PLAN.gitlab.json
+  after_script:
+    - rm -rf "${CI_PROJECT_DIR}/.wif"
+  artifacts:
+    expire_in: 1 hour
+    when: on_success
+    paths:
+      - $DEV_PLAN.tfplan
+      - $DEV_PLAN.txt
+      - $DEV_PLAN.json
+      - .terraform.lock.hcl
+    reports:
+      terraform:
+        - $DEV_PLAN.gitlab.json
+
+dev-apply:
+  stage: apply
+  extends: .id_tokens
+  needs:
+    - dev-plan
+  # Shares the lock with the hibernation jobs so a deploy never overlaps a
+  # nightly shutdown/startup of the same environments.
+  resource_group: composer-hibernation-dev
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $HIBERNATE_ACTION
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+  script:
+    - !reference [.gcp_wif_auth, script]
+    - !reference [.terraform_init, script]
+    - terraform apply -input=false $DEV_PLAN.tfplan
+  after_script:
+    - rm -rf "${CI_PROJECT_DIR}/.wif"

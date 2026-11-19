@@ -13,6 +13,7 @@ This Terraform module deploys one or more **Google Cloud Composer 3** environmen
 | **Firewall Rules** | Internal communication + GCP health-check ranges |
 | **KMS Key Ring + Key** | Customer-managed encryption key (CMEK) — optional |
 | **GCP API Enablement** | Automatically enables required APIs |
+| **Hibernation** *(optional)* | Scheduled snapshot + delete of non-prod environments out of hours, recreate + restore in the morning — see [docs/hibernation.md](docs/hibernation.md) |
 
 Almost every setting has a sensible default. A minimal config needs only `project_id` and an environment key.
 
@@ -121,6 +122,13 @@ composer_environments:
       key: value                                        Merged with per-env labels (per-env wins on
                                                         key conflicts).
                                                         Default: {}
+
+  hibernation:                               [Optional] Global defaults for scheduled hibernation
+      enabled: false                                    (snapshot + delete out of hours, recreate + restore
+      ...                                               in the morning). Every field can be overridden
+                                                        per environment. See the per-environment section
+                                                        below and docs/hibernation.md.
+                                                        Default: hibernation disabled
 
   environments:                              [Required] Map of Composer environments to create.
                                                         Each key becomes the default environment name.
@@ -273,8 +281,11 @@ composer_environments:
               image_version:                 [Optional] Composer image version string. When omitted,
                                                         GCP selects the latest stable Composer 3 version.
                                                         Must start with "composer-3" if provided. Check
-                                                        available: gcloud composer environments
-                                                        list-image-versions --location=REGION
+                                                        available versions on the Composer versions
+                                                        page or GET .../v1/projects/P/locations/R/
+                                                        imageVersions (Composer REST API). An alias such
+                                                        as composer-3-airflow-2.10.5 (newest build) is
+                                                        recommended, especially with hibernation.
                                                         Default: null (GCP picks latest)
 
               airflow_config_overrides:      [Optional] Airflow configuration property overrides.
@@ -499,6 +510,54 @@ composer_environments:
                                                         "CLOUD_LOGGING_ONLY" writes only to Logging.
                                                         Default: "CLOUD_LOGGING_AND_CLOUD_STORAGE"
 
+      ── Hibernation ──────────────────────────────────────────────────────────────────────────────
+      (entire block optional; merged field by field over the global hibernation block;
+       driven by scripts/hibernation and pipelines/composer-hibernation.yml — docs/hibernation.md)
+
+          hibernation:
+              enabled:                       [Optional] Snapshot + delete this environment outside
+                                                        working hours and restore it in the morning.
+                                                        Refused for production environments (labels
+                                                        env/environment/tier/stage = prod|production|prd,
+                                                        else a prod token in the name).
+                                                        Default: false
+
+              snapshot_bucket:               [Optional] Bucket for snapshots + hibernation-state.json.
+                                                        Created by the scripts when missing.
+                                                        Default: "{project_id}-composer-snapshots"
+
+              snapshot_bucket_location:      [Optional] Location used when creating the bucket.
+                                                        Default: environment region
+
+              create_snapshot_bucket:        [Optional] Create the snapshot bucket if missing.
+                                                        Default: true
+
+              snapshot_prefix:               [Optional] Folder in the bucket; snapshots are stored in
+                                                        {prefix}/{project}/{region}/{env-name}/.
+                                                        Default: "composer-hibernation"
+
+              snapshot_retention_count:      [Optional] Snapshots kept per environment (>= 1).
+                                                        Default: 7
+
+              pin_image_version:             [Optional] With no software_config.image_version, recreate
+                                                        on the snapshot's Airflow version
+                                                        (composer-3-airflow-X.Y.Z).
+                                                        Default: true
+
+              delete_orphaned_bucket:        [Optional] Delete the auto-created environment bucket a
+                                                        deletion leaves behind (never storage.bucket).
+                                                        Default: true
+
+              orphaned_bucket_retention_days:
+                                             [Optional] Days before an orphaned bucket is deleted.
+                                                        Default: 7
+
+              load_options:                  [Optional] Snapshot load flags. Terraform already applies
+                  skip_pypi_packages_installation:      the YAML's packages, env vars and overrides.
+                  skip_environment_variables_setting:   Defaults: true, true, true, false
+                  skip_airflow_overrides_setting:
+                  skip_gcs_data_copying:
+
       ── Custom Storage ───────────────────────────────────────────────────────────────────────────
       (optional; omit for GCP auto-created bucket)
 
@@ -520,6 +579,7 @@ composer_environments:
 | `configs/production.yaml` | 1 (`composer-prod`) | CMEK, HA, Cloud NAT, DAG processor, snapshots |
 | `configs/private-ip.yaml` | 1 (`composer-private`) | Private endpoint, PSC, master auth networks |
 | `configs/multi-environment.yaml` | 3 (`dev`, `staging`, `prod`) | All tiers in one file with shared globals |
+| `configs/hibernation.yaml` | 3 | Every hibernation setting documented; two hibernating non-prod envs, prod excluded |
 
 ---
 
@@ -585,8 +645,9 @@ Output structure per environment:
 
 ```
 .
+├── .gitlab-ci.yml                   # CI: checks, tests, includes pipelines/*
 ├── main.tf                          # Reads YAML, iterates environments via for_each
-├── variables.tf                     # config_file variable
+├── variables.tf                     # config_file, fallback_image_versions
 ├── outputs.tf                       # Map of all environment outputs
 ├── versions.tf                      # Provider configuration
 ├── configs/
@@ -594,8 +655,22 @@ Output structure per environment:
 │   ├── development.yaml             # Dev single-env
 │   ├── production.yaml              # Full prod single-env
 │   ├── private-ip.yaml              # Private networking
-│   └── multi-environment.yaml       # 3 environments in one file
+│   ├── multi-environment.yaml       # 3 environments in one file
+│   └── hibernation.yaml             # Hibernation example (all settings)
+├── docs/
+│   └── hibernation.md               # Scheduled shutdown/startup guide
+├── pipelines/
+│   ├── dev.yml                      # dev-plan / dev-apply (WIF, GCS backend)
+│   └── composer-hibernation.yml     # Scheduled shutdown/startup jobs
+├── scripts/
+│   ├── ci/                          # ensure-tools.sh, create-hibernation-schedules.sh
+│   └── hibernation/
+│       ├── composer-shutdown.sh     # Snapshot → verify → targeted destroy
+│       ├── composer-startup.sh      # Targeted apply from the YAML → snapshot load
+│       ├── lib/common.sh            # Shared library (guards, gcloud, terraform, state file)
+│       └── resolver/main.tf         # Offline YAML resolution via composer-3-settings
 ├── modules/
+│   ├── composer-3-settings/         # Provider-less settings resolver (shared with scripts)
 │   └── composer-3/
 │       ├── main.tf                  # google_composer_environment resource
 │       ├── variables.tf             # environment_key, config, global_config
@@ -605,13 +680,18 @@ Output structure per environment:
 │       ├── iam.tf                   # Service account + IAM bindings
 │       ├── network.tf               # VPC, subnet, NAT, firewall
 │       ├── kms.tf                   # CMEK encryption resources
+│       ├── settings.tf              # Calls composer-3-settings
 │       └── services.tf              # GCP API enablement
 └── tests/
     ├── setup/main.tf                # Test helper module
     ├── basic.tftest.hcl             # Basic config test
     ├── production.tftest.hcl        # Production config test
     ├── validation.tftest.hcl        # Multi-config + validation tests
-    └── validate_configs.py          # Python YAML validation script
+    ├── hibernation.tftest.hcl       # Hibernation settings (root)
+    ├── composer_3_module.tftest.hcl # Guard-rail preconditions (module)
+    ├── validate_configs.py          # Python YAML validation script
+    ├── ci/                          # Pipeline rules, CI schema, schedule helper tests
+    └── hibernation/                 # e2e (real Terraform plans), unit, resolver tests
 ```
 
 ---
@@ -628,8 +708,11 @@ terraform fmt -check -recursive
 # YAML config validation (Python)
 python tests/validate_configs.py
 
-# Native Terraform tests (requires >= 1.6)
+# Native Terraform tests (requires >= 1.7 for mock providers)
 terraform test
+
+# Hibernation scripts, pipeline rules, schedule helper (bats, shellcheck, jq)
+tests/hibernation/run.sh
 ```
 
 ---
@@ -651,5 +734,5 @@ terraform destroy -var 'config_file=configs/my-env.yaml'
 | `Error enabling API` | Ensure deploying identity has `roles/serviceusage.serviceUsageAdmin` |
 | `Service account not found` | Composer agent SA is created when API is enabled — re-run `terraform apply` |
 | `IP range overlap` | Each env creates its own VPC, so default CIDRs don't conflict. If sharing a VPC, customise CIDRs per env. |
-| `Image version not found` | Run `gcloud composer environments list-image-versions --location=REGION` |
+| `Image version not found` | See the Composer versions page, or `GET https://composer.googleapis.com/v1/projects/P/locations/R/imageVersions` (versions with `creationDisabled: true` can no longer be used to create environments) |
 | Empty `{}` env value | Valid — all settings use module defaults |

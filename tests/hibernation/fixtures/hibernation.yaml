@@ -1,0 +1,34 @@
+# Test fixture: two hibernating non-prod environments and one production
+# environment that must never be touched.
+project_id: "hib-test-project"
+region: "europe-west2"
+
+labels:
+  managed_by: terraform
+
+hibernation:
+  enabled: true
+  snapshot_retention_count: 2
+
+environments:
+  # All defaults: auto-created bucket (deleted after hibernation), image
+  # version chosen by GCP (pinned from the snapshot on restore).
+  composer-dev:
+    labels:
+      env: dev
+
+  # Custom bucket (kept and reused) and a pinned image version (never
+  # overridden by the snapshot's version).
+  composer-test:
+    labels:
+      env: test
+    storage:
+      bucket: "hib-test-project-composer-test-data"
+    software_config:
+      image_version: "composer-3-airflow-2.9.3"
+
+  composer-prod:
+    labels:
+      env: production
+    hibernation:
+      enabled: false

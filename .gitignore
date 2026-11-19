@@ -11,3 +11,9 @@ override.tf.json
 terraform.rc
 .claude/
 .gitignore
+# CI / hibernation run artefacts
+.wif/
+.hibernation/
+tests/hibernation/.results/
+tests/ci/.cache/
+__pycache__/

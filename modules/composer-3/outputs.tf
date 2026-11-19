@@ -19,8 +19,12 @@ output "dag_gcs_prefix" {
 }
 
 output "gcs_bucket" {
-  description = "GCS bucket used by the Composer environment"
-  value       = google_composer_environment.this.storage_config[0].bucket
+  description = "GCS bucket used by the Composer environment (custom storage.bucket, else the bucket GCP auto-created, derived from dag_gcs_prefix)"
+  value = try(
+    google_composer_environment.this.storage_config[0].bucket,
+    regex("^gs://([^/]+)", google_composer_environment.this.config[0].dag_gcs_prefix)[0],
+    null
+  )
 }
 
 output "service_account_email" {
@@ -41,6 +45,16 @@ output "subnetwork_self_link" {
 output "kms_key_id" {
   description = "KMS key ID used for CMEK encryption (null if CMEK disabled)"
   value       = local.kms_key_id
+}
+
+output "hibernation" {
+  description = "Resolved hibernation settings (enabled flag, snapshot bucket/location, retention, load options)"
+  value       = local.hibernation
+}
+
+output "image_version" {
+  description = "Image version the environment runs (as reported by the provider)"
+  value       = try(google_composer_environment.this.config[0].software_config[0].image_version, null)
 }
 
 output "composer_environment_config" {

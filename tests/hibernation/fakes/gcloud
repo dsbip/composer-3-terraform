@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Test double for gcloud: every call is served by the simulated GCP world.
+exec python3 "$(dirname "${BASH_SOURCE[0]}")/fakegcp.py" gcloud "$@"

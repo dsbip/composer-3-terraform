@@ -1,0 +1,112 @@
+# ============================================================================
+# Composer 3 hibernation — shut down non-production environments outside
+# working hours and bring them back in the morning.
+#
+#   shutdown: scripts/hibernation/composer-shutdown.sh
+#             snapshot → verify → targeted terraform destroy of the Composer
+#             environment only (network / service account / IAM stay)
+#   startup:  scripts/hibernation/composer-startup.sh
+#             targeted terraform apply from the SAME YAML → snapshot load
+#
+# Which environments take part is decided by the YAML (`hibernation.enabled`),
+# never by this file. Production environments are refused by the scripts and
+# by a Terraform precondition.
+#
+# Triggering (CI/CD → Schedules, on the protected default branch — or run
+# scripts/ci/create-hibernation-schedules.sh):
+#   "Composer hibernation: shutdown"  cron 0 19 * * 1-5   HIBERNATE_ACTION=shutdown
+#   "Composer hibernation: startup"   cron 0 7 * * 1-5    HIBERNATE_ACTION=startup
+#   (timezone e.g. Europe/London; Mon-Fri covers weekends automatically)
+# Optional schedule variable HIBERNATE_ENVIRONMENTS=composer-dev,composer-qa
+# limits a schedule to some environments (e.g. different hours per team).
+#
+# Ad-hoc: Build → Pipelines → Run pipeline with HIBERNATE_ACTION=shutdown or
+# startup (runs immediately), or without it to get manual buttons.
+#
+# After the first run of each job, set the resource group to oldest_first so a
+# delayed shutdown can never be overtaken by the next startup:
+#   curl -X PUT -H "PRIVATE-TOKEN: <token>" \
+#     "$CI_API_V4_URL/projects/<id>/resource_groups/composer-hibernation-dev?process_mode=oldest_first"
+# ============================================================================
+
+.composer_hibernation_base:
+  stage: hibernate
+  extends: .id_tokens
+  needs: []
+  interruptible: false
+  # Snapshot save/load and environment create/delete each take 10-40 minutes.
+  timeout: 3h
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - scheduler_failure
+  variables:
+    HIBERNATE_CONFIG_FILE: ${DEV_CONFIG_FILE}
+    TF_BACKEND_BUCKET: ${DEV_BUCKET}
+    TF_BACKEND_PREFIX: ${DEV_BUCKET_PREFIX}
+    HIBERNATE_WORK_DIR: ${CI_PROJECT_DIR}/.hibernation/${CI_JOB_NAME_SLUG}
+    # Leave room to upload logs/plans when the script itself runs too long.
+    RUNNER_SCRIPT_TIMEOUT: 2h45m
+    RUNNER_AFTER_SCRIPT_TIMEOUT: 10m
+  before_script:
+    - ./scripts/ci/ensure-tools.sh
+    - !reference [.gcp_wif_auth, script]
+    - terraform version
+    - echo "Pipeline created at ${CI_PIPELINE_CREATED_AT} (source=${CI_PIPELINE_SOURCE}, action=${HIBERNATE_ACTION:-manual})"
+  after_script:
+    - rm -rf "${CI_PROJECT_DIR}/.wif"
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - .hibernation/
+
+.composer_hibernation:
+  extends: .composer_hibernation_base
+  # One lock for every job touching these environments (incl. dev-apply).
+  resource_group: composer-hibernation-dev
+
+dev-composer-shutdown:
+  extends: .composer_hibernation
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $HIBERNATE_ACTION == "shutdown"
+    - if: $CI_PIPELINE_SOURCE == "web" && $HIBERNATE_ACTION == "shutdown"
+    - if: $CI_PIPELINE_SOURCE == "web" && $HIBERNATE_ACTION == null
+      when: manual
+      allow_failure: true
+  script:
+    - ./scripts/hibernation/composer-shutdown.sh
+
+dev-composer-startup:
+  extends: .composer_hibernation
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $HIBERNATE_ACTION == "startup"
+    - if: $CI_PIPELINE_SOURCE == "web" && $HIBERNATE_ACTION == "startup"
+    - if: $CI_PIPELINE_SOURCE == "web" && $HIBERNATE_ACTION == null
+      when: manual
+      allow_failure: true
+  script:
+    - ./scripts/hibernation/composer-startup.sh
+
+# Read-only rehearsal (no snapshot, no apply, no state-file writes): resolves
+# the YAML, inspects the environments and runs the guarded terraform plans.
+dev-composer-hibernation-dry-run:
+  # Plans only — deliberately not in the exclusive resource group.
+  extends: .composer_hibernation_base
+  timeout: 30m
+  variables:
+    RUNNER_SCRIPT_TIMEOUT: 25m
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "web" && $HIBERNATE_ACTION == "dry-run"
+    - if: $CI_PIPELINE_SOURCE == "web" && $HIBERNATE_ACTION == null
+      when: manual
+      allow_failure: true
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+  script:
+    - ./scripts/hibernation/composer-shutdown.sh --dry-run --work-dir "${HIBERNATE_WORK_DIR}/shutdown"
+    - ./scripts/hibernation/composer-startup.sh --dry-run --skip-init --work-dir "${HIBERNATE_WORK_DIR}/startup"

@@ -1,0 +1,3 @@
+# jq programs are deliberately single-quoted ($vars are jq variables).
+disable=SC2016
+external-sources=true

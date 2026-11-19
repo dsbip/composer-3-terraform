@@ -19,3 +19,14 @@ variable "global_config" {
   type        = any
   default     = {}
 }
+
+variable "fallback_image_version" {
+  description = "Image version used only when the YAML leaves software_config.image_version unset (set by the hibernation startup script to restore on the snapshot's Airflow version). null = let GCP pick."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.fallback_image_version == null || can(regex("^composer-3-airflow-[0-9]+(\\.[0-9]+){0,2}(-build\\.[0-9]+)?$", var.fallback_image_version))
+    error_message = "fallback_image_version must look like composer-3-airflow-X.Y.Z (optionally with -build.N)."
+  }
+}

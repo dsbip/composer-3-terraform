@@ -1,0 +1,96 @@
+# ============================================================================
+# GitLab CI — Cloud Composer 3 Terraform module
+#
+#   validate   terraform fmt/validate, YAML config validation
+#   test       terraform test (mock providers), hibernation script tests
+#   plan/apply dev Terraform deployment                 (pipelines/dev.yml)
+#   hibernate  scheduled shutdown/startup of non-prod   (pipelines/composer-hibernation.yml)
+#
+# The runner image needs: gcloud, terraform, jq, python3, bash, coreutils.
+# scripts/ci/ensure-tools.sh installs terraform/jq (and the test tools) when
+# the image lacks them.
+# ============================================================================
+
+stages:
+  - validate
+  - test
+  - plan
+  - apply
+  - hibernate
+
+variables:
+  # An image with gcloud (ideally also terraform + jq). Project/group CI/CD
+  # variables take precedence, so set CI_IMAGE there to your usual image.
+  CI_IMAGE: gcr.io/google.com/cloudsdktool/google-cloud-cli:stable
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TERRAFORM_VERSION: "1.17.2"   # installed only when the image has no terraform
+
+default:
+  image: ${CI_IMAGE}
+  before_script:
+    - ./scripts/ci/ensure-tools.sh
+
+workflow:
+  rules:
+    # Scheduled hibernation pipelines and manual runs. A new commit must never
+    # auto-cancel a queued/running shutdown or startup.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      auto_cancel:
+        on_new_commit: none
+    - if: $CI_PIPELINE_SOURCE == "web"
+      auto_cancel:
+        on_new_commit: none
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # Avoid duplicate branch + MR pipelines.
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+include:
+  - local: pipelines/dev.yml
+  - local: pipelines/composer-hibernation.yml
+
+# ── Checks (never part of the scheduled hibernation pipelines) ──────────────
+.checks_rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $HIBERNATE_ACTION
+      when: never
+    - when: on_success
+
+terraform-validate:
+  stage: validate
+  extends: .checks_rules
+  needs: []
+  variables:
+    ENSURE_TEST_TOOLS: "true"   # python3 + PyYAML for validate_configs.py
+  script:
+    - terraform fmt -check -recursive
+    - terraform init -backend=false -input=false
+    - terraform validate
+    - (cd tests/setup && terraform init -backend=false -input=false && terraform validate)
+    - python3 tests/validate_configs.py
+
+terraform-test:
+  stage: test
+  extends: .checks_rules
+  needs: []
+  script:
+    - terraform init -backend=false -input=false
+    - terraform test
+
+hibernation-tests:
+  stage: test
+  extends: .checks_rules
+  needs: []
+  variables:
+    ENSURE_TEST_TOOLS: "true"
+  script:
+    - ./tests/hibernation/run.sh
+  artifacts:
+    when: on_failure
+    expire_in: 7 days
+    paths:
+      - tests/hibernation/.results/

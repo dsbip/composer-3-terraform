@@ -10,6 +10,9 @@ output "environments" {
       service_account_email = env.service_account_email
       network_self_link     = env.network_self_link
       subnetwork_self_link  = env.subnetwork_self_link
+      image_version         = env.image_version
+      hibernation_enabled   = env.hibernation.enabled
+      snapshot_location     = env.hibernation.enabled ? env.hibernation.snapshot_location : null
     }
   }
 }

@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Test double for terraform used by tests/hibernation.
+#
+# Everything is delegated to the REAL terraform binary ($REAL_TERRAFORM) —
+# init, plan, show, state, output and the offline settings resolver — except:
+#   * `plan` always gets -refresh=false (there is no real GCP to refresh from;
+#     the only API calls left are served by tools/stub_google_api.py),
+#   * `apply PLANFILE` is simulated: the real plan JSON is applied to the local
+#     state by tools/tfstate_apply.py and Composer creates/deletes are mirrored
+#     into the fake GCP world.
+#
+# Fault injection (environment):
+#   FAKE_TF_FAIL_PLAN=1           plan exits 1
+#   FAKE_TF_FAIL_APPLY=before     apply exits 1 without changing anything
+#   FAKE_TF_FAIL_APPLY=after      apply changes everything, then exits 1
+#   FAKE_TF_SHOW_JQ='<jq filter>' rewrite `show -json` output (plan-guard tests)
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+real="${REAL_TERRAFORM:?REAL_TERRAFORM must point to the real terraform binary}"
+
+printf '%s\n' "$(jq -cn '$ARGS.positional' --args -- "$@")" >>"${FAKE_GCP_DIR:?}/terraform-calls.log"
+
+chdir="" sub=""
+for a in "$@"; do
+  case "${a}" in
+  -chdir=*) chdir="${a#-chdir=}" ;;
+  -*) ;;
+  *)
+    sub="${a}"
+    break
+    ;;
+  esac
+done
+
+# The offline resolver never needs any faking.
+if [[ "${chdir}" == */scripts/hibernation/resolver ]]; then
+  exec "${real}" "$@"
+fi
+
+case "${sub}" in
+plan)
+  [[ "${FAKE_TF_FAIL_PLAN:-}" == 1 ]] && {
+    echo "Error: injected plan failure" >&2
+    exit 1
+  }
+  exec "${real}" "$@" -refresh=false
+  ;;
+show)
+  if [[ -n "${FAKE_TF_SHOW_JQ:-}" && " $* " == *" -json "* ]]; then
+    "${real}" "$@" | jq -c "${FAKE_TF_SHOW_JQ}"
+    exit "${PIPESTATUS[0]}"
+  fi
+  exec "${real}" "$@"
+  ;;
+apply)
+  planfile="${*: -1}"
+  [[ -f "${planfile}" ]] || {
+    echo "fake terraform: apply supports saved plan files only (got ${planfile})" >&2
+    exit 1
+  }
+  [[ "${FAKE_TF_FAIL_APPLY:-}" == before ]] && {
+    echo "Error: injected apply failure" >&2
+    exit 1
+  }
+  root="${chdir:-.}"
+  tmp="$(mktemp -d)"
+  "${real}" -chdir="${root}" show -json "${planfile}" >"${tmp}/plan.json"
+  python3 "${here}/../tools/tfstate_apply.py" "${tmp}/plan.json" "${root}/terraform.tfstate" \
+    --schema "${FAKE_TF_SCHEMA:?}" --composer-out "${tmp}/events.json"
+  python3 "${here}/fakegcp.py" apply-events "${tmp}/events.json"
+  echo "Apply complete! (simulated) $(jq '[.resource_changes[]? | select(.change.actions != ["no-op"] and .change.actions != ["read"])] | length' "${tmp}/plan.json") change(s)."
+  rm -rf "${tmp}"
+  [[ "${FAKE_TF_FAIL_APPLY:-}" == after ]] && {
+    echo "Error: injected apply failure (after changes)" >&2
+    exit 1
+  }
+  exit 0
+  ;;
+*)
+  exec "${real}" "$@"
+  ;;
+esac

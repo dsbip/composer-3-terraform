@@ -42,6 +42,15 @@ Three critical bindings beyond the SA's own roles:
 2. `roles/iam.serviceAccountUser` → Composer service agent on the environment's SA
 3. KMS encrypter/decrypter → Composer, Artifact Registry, and GCS agents (when CMEK enabled)
 
+### Hibernation (scheduled snapshot + delete / recreate + load)
+- Opt-in per env via the `hibernation` block (global → per-env merge); refused for production (labels `env|environment|tier|stage` = `prod|production|prd`, else a prod token in the name) by a precondition on `google_composer_environment.this` and by the scripts
+- `modules/composer-3-settings` is provider-less and the single source of truth for identity/labels/hibernation resolution; `modules/composer-3` uses it, and `scripts/hibernation/resolver` evaluates it offline so the bash scripts never re-implement YAML defaults
+- Shutdown deletes ONLY `google_composer_environment` (resource-level `-target` in destroy mode is instance-precise); network/SA/IAM/KMS stay
+- Startup targets the whole module instance `module.composer["<key>"]` — resource-level create targets pull in same-named dependencies of ALL instances (verified), leaking other envs' pending changes
+- Plans are guarded (`guard_destroy_plan`, `guard_create_plan`, `plan_must_contain`) — a typo'd `-target` silently plans nothing
+- `var.fallback_image_versions` (root) / `fallback_image_version` (module) only fill a null YAML `image_version`; startup sets it to the snapshot's `composer-3-airflow-X.Y.Z` (snapshots load only into same-or-later Airflow)
+- Per-env state file `<snapshot_location>/hibernation-state.json` (SNAPSHOT_SAVED → HIBERNATED → RESTORING → ACTIVE) makes both scripts idempotent; see `decide_*_action` in `scripts/hibernation/lib/common.sh`
+
 ### API enablement idempotency
 - Each module instance enables APIs independently via `google_project_service`
 - `disable_on_destroy = false` makes this safe for multi-environment in the same project
@@ -58,6 +67,12 @@ Three critical bindings beyond the SA's own roles:
 | `modules/composer-3/iam.tf` | Service account + Composer agent IAM |
 | `modules/composer-3/network.tf` | VPC, subnet, Cloud NAT, firewall |
 | `modules/composer-3/kms.tf` | CMEK key ring, key, IAM grants |
+| `modules/composer-3-settings/main.tf` | Provider-less resolution: identity, labels, prod detection, hibernation defaults + `validation_errors` |
+| `scripts/hibernation/composer-shutdown.sh` | Snapshot → verify → guarded targeted destroy → state file |
+| `scripts/hibernation/composer-startup.sh` | Guarded targeted apply from the YAML → version check → snapshot load |
+| `scripts/hibernation/lib/common.sh` | Shared bash library (resolver, gcloud/terraform helpers, plan guards, decision tables, state file) |
+| `pipelines/composer-hibernation.yml` | Scheduled GitLab jobs (`HIBERNATE_ACTION=shutdown|startup`) |
+| `docs/hibernation.md` | Operator guide for hibernation |
 
 ## YAML Config Structure
 
@@ -84,8 +99,9 @@ environments:
 
 - `terraform fmt -check -recursive` — formatting
 - `terraform validate` — syntax and configuration (root + test modules)
+- `tests/hibernation/run.sh` — shellcheck, GitLab CI schema + rule evaluation, bats unit/resolver/schedule tests and the e2e suite (real Terraform plans offline via `tests/hibernation/tools/stub_google_api.py`; only `apply` and GCP are simulated by `tests/hibernation/fakes/`)
 - `python tests/validate_configs.py` — YAML structure/constraint validation for all 5 configs
-- `tests/*.tftest.hcl` — native tests with mock providers (Terraform >= 1.6)
+- `tests/*.tftest.hcl` — native tests with mock providers (Terraform >= 1.7); `expect_failures` cannot reference resources inside child modules, so module preconditions are tested with `module { source = "./modules/composer-3" }` runs
 - `terraform plan` — requires GCP credentials (validates provider interaction)
 
 ## Common Gotchas
@@ -95,4 +111,7 @@ environments:
 - CIDR ranges: each env creates its own VPC so defaults don't conflict; customise if sharing VPCs
 - `airflow_config_overrides` keys use `section-key` format (hyphen, not dot)
 - Empty env value (`my-env: {}`) is valid — all settings default
-- `image_version: null` (default) lets GCP pick the latest stable version
+- `image_version: null` (default) lets GCP pick its default image — Google is still rolling out the switch of that default from Composer 2 to 3, so pin an alias like `composer-3-airflow-2.10.5` (required in practice for hibernating envs; builds are only creatable for 12-18 months)
+- GA gcloud has no `list-image-versions`; use the Composer REST `imageVersions` endpoint (`creationDisabled`)
+- Hibernation scripts need the gcs backend: `TF_BACKEND_BUCKET`/`TF_BACKEND_PREFIX` (a git-ignored `backend_override.tf` is generated; `-backend-config` without a backend block silently falls back to local state, so init is verified)
+- While an env is hibernated, a normal full apply recreates it empty; the next startup loads the snapshot into it

@@ -155,6 +155,15 @@ resource "google_composer_environment" "this" {
     }
   }
 
+  lifecycle {
+    # Catches invalid hibernation settings — including hibernation enabled on
+    # a production environment — at plan time, before any script can act.
+    precondition {
+      condition     = length(module.settings.validation_errors) == 0
+      error_message = "Invalid configuration for environment '${var.environment_key}': ${join("; ", module.settings.validation_errors)}"
+    }
+  }
+
   depends_on = [
     google_project_service.required,
     google_project_iam_member.composer_sa_roles,

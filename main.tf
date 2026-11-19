@@ -7,6 +7,7 @@ locals {
     labels      = try(local.raw_config.labels, {})
     enable_apis = try(local.raw_config.enable_apis, true)
     apis        = try(local.raw_config.apis, [])
+    hibernation = try(local.raw_config.hibernation, null)
   }
 
   environments = try(local.raw_config.environments, {})
@@ -16,7 +17,8 @@ module "composer" {
   source   = "./modules/composer-3"
   for_each = local.environments
 
-  environment_key = each.key
-  config          = each.value
-  global_config   = local.global_config
+  environment_key        = each.key
+  config                 = each.value
+  global_config          = local.global_config
+  fallback_image_version = lookup(var.fallback_image_versions, each.key, null)
 }
