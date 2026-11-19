@@ -32,11 +32,12 @@ setup() {
   unset HIBERNATE_CONFIG_FILE HIBERNATE_ENVIRONMENTS HIBERNATE_DRY_RUN HIBERNATE_SKIP_INIT \
     HIBERNATE_TF_VAR_FILES HIBERNATE_WORK_DIR HIBERNATE_SKIP_IMAGE_CHECK HIBERNATE_COMPOSER_API \
     HIBERNATE_LOAD_ATTEMPTS HIBERNATE_GCLOUD_RETRIES HIBERNATE_WAIT_TIMEOUT_MINUTES \
-    HIBERNATE_OPERATION_TIMEOUT_MINUTES HIBERNATE_MAX_PARALLEL \
+    HIBERNATE_OPERATION_TIMEOUT_MINUTES HIBERNATE_MAX_PARALLEL HIBERNATE_FRESH_ENV_HOURS \
+    HIBERNATE_LOCK_TIMEOUT_SECONDS \
     TF_ROOT TF_MODULE_ADDRESS TF_BACKEND_BUCKET TF_BACKEND_PREFIX TF_DATA_DIR TF_LOCK_TIMEOUT \
     GITLAB_CI CI_PIPELINE_ID CI_JOB_URL CI_PIPELINE_SOURCE GITLAB_USER_LOGIN CI_COMMIT_SHORT_SHA \
     STUB_TF_BACKEND STUB_TF_INIT_RC STUB_TF_STATE_RC
-  export HIBERNATE_POLL_SECONDS=0 HIBERNATE_RETRY_SLEEP_SECONDS=0
+  export HIBERNATE_POLL_SECONDS=0 HIBERNATE_RETRY_SLEEP_SECONDS=0 HIBERNATE_POLL_FAILURE_GRACE_SECONDS=0
   export HIBERNATE_COMPOSER_API="https://composer.unit.test"
 
   # shellcheck source=SCRIPTDIR/../../scripts/hibernation/lib/common.sh
@@ -1005,13 +1006,39 @@ EOF
   assert_contains "${stderr}" "restore image composer-3-airflow-2.10.5 is creatable"
 }
 
-@test "check_restorable: pin_image_version false and no YAML image -> 0 without an API call" {
-  t_pages first.json
+@test "check_restorable: pin_image_version false and no YAML image -> GCP's default image must load the snapshot" {
+  t_pages first.json tok-page-2.json
+  # Default (isDefault) is composer-3-airflow-2.10.5-build.17.
   run --separate-stderr check_restorable_out composer-nopin composer-3-airflow-2.10.5-build.17
   assert_status 0
   assert_eq "${output}" ""
-  assert_contains "${stderr}" "restore will use GCP's default image"
-  [[ ! -f "${STUB_DIR}/curl.count" ]]
+  assert_contains "${stderr}" "restore will use GCP's default image composer-3-airflow-2.10.5-build.17"
+  run --separate-stderr check_restorable_out composer-nopin composer-3-airflow-2.11.0-build.2
+  assert_status 1
+  assert_contains "${output}" "GCP's default image composer-3-airflow-2.10.5-build.17, which cannot load a snapshot of the running composer-3-airflow-2.11.0-build.2"
+}
+
+@test "check_restorable: GCP default image unknown or not Composer 3 -> fail closed (unless skipped)" {
+  t_pages first.json tok-page-2.json
+  touch "${STUB_DIR}/curl-fail"
+  run --separate-stderr check_restorable_out composer-nopin composer-3-airflow-2.10.5-build.17
+  assert_status 1
+  assert_contains "${output}" "could not determine GCP's default image"
+  rm -f "${STUB_DIR}/curl-fail"
+  jq '.imageVersions[0].isDefault = false' "${UNIT}/image-versions/first.json" >"${STUB_DIR}/pages/first.json"
+  run --separate-stderr check_restorable_out composer-nopin composer-3-airflow-2.10.5-build.17
+  assert_status 1
+  assert_contains "${stderr}" "names no default image"
+  jq '.imageVersions[0].imageVersionId = "composer-2.9.7-airflow-2.9.3"' "${UNIT}/image-versions/first.json" >"${STUB_DIR}/pages/first.json"
+  run --separate-stderr check_restorable_out composer-nopin composer-3-airflow-2.10.5-build.17
+  assert_status 1
+  assert_contains "${output}" "not a Composer 3 image"
+  local calls
+  calls="$(cat "${STUB_DIR}/curl.count")"
+  HIBERNATE_SKIP_IMAGE_CHECK=true
+  run --separate-stderr check_restorable_out composer-nopin composer-3-airflow-2.10.5-build.17
+  assert_status 0
+  assert_eq "$(cat "${STUB_DIR}/curl.count")" "${calls}" "no API call when skipped"
 }
 
 @test "check_restorable: YAML downgrade (2.9.3 vs running 2.10.5) fails before any API call" {
@@ -1188,11 +1215,50 @@ EOF
   assert_contains "${output}" "skip_init=true"
 }
 
-@test "parse_common_args: --var-file (both forms) after HIBERNATE_TF_VAR_FILES, in order" {
+@test "parse_common_args: --var-file (both forms) in order; replaces HIBERNATE_TF_VAR_FILES" {
+  HIBERNATE_TF_VAR_FILES="env1.tfvars,env2.tfvars" run bash "${UNIT}/parse-args.sh" shutdown -c x.yaml
+  assert_status 0
+  assert_contains "${output}" "var_files=env1.tfvars|env2.tfvars"
   HIBERNATE_TF_VAR_FILES="env1.tfvars,env2.tfvars" run bash "${UNIT}/parse-args.sh" shutdown -c x.yaml \
     --var-file a.tfvars --var-file=b.tfvars
   assert_status 0
-  assert_contains "${output}" "var_files=env1.tfvars|env2.tfvars|a.tfvars|b.tfvars"
+  assert_contains "${output}" "var_files=a.tfvars|b.tfvars"
+}
+
+@test "parse_common_args: --env replaces HIBERNATE_ENVIRONMENTS" {
+  HIBERNATE_ENVIRONMENTS=composer-qa run bash "${UNIT}/parse-args.sh" shutdown -c x.yaml --env composer-dev
+  assert_status 0
+  assert_contains "${output}" "envs=composer-dev"
+  assert_contains "${output}" "env_count=1"
+}
+
+@test "parse_common_args: a selection naming no environment is refused (never 'all')" {
+  local v
+  for v in "" " " "," " , "; do
+    run bash "${UNIT}/parse-args.sh" shutdown -c x.yaml --env "${v}"
+    assert_status 2
+    assert_contains "${output}" "names no environment"
+    run bash "${UNIT}/parse-args.sh" shutdown -c x.yaml "--env=${v}"
+    assert_status 2
+    HIBERNATE_ENVIRONMENTS="${v}" run bash "${UNIT}/parse-args.sh" startup -c x.yaml
+    assert_status 2
+    assert_contains "${output}" "HIBERNATE_ENVIRONMENTS is set but names no environment"
+  done
+  # Unset = every enabled environment (documented default).
+  run bash "${UNIT}/parse-args.sh" startup -c x.yaml
+  assert_status 0
+  assert_contains "${output}" "env_count=0"
+}
+
+@test "parse_common_args: --force-load (startup only) excludes --skip-load" {
+  run bash "${UNIT}/parse-args.sh" startup -c x.yaml --force-load
+  assert_status 0
+  assert_contains "${output}" "force_load=true"
+  run bash "${UNIT}/parse-args.sh" shutdown -c x.yaml --force-load
+  assert_status 2
+  run bash "${UNIT}/parse-args.sh" startup -c x.yaml --force-load --skip-load
+  assert_status 2
+  assert_contains "${output}" "mutually exclusive"
 }
 
 @test "parse_common_args: --work-dir (both forms) and HIBERNATE_WORK_DIR" {
@@ -1998,4 +2064,244 @@ LOAD_DONE='{"name": "projects/hib-test-project/locations/europe-west2/operations
   assert_contains "$(cat "${OPT_WORK_DIR}/logs/composer-test-snapshot.log")" "composer-test log line"
   assert_contains "${output}" "==== snapshot: composer-nopin ===="
   assert_contains "${output}" "about to die"
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# Review hardening: restore-point decisions, identity, work dir, GCS/IAM
+# ════════════════════════════════════════════════════════════════════════════
+
+@test "decide_startup_action: RUNNING with re-created / stale / already-restored environments" {
+  local st snap rec fresh done want got failures=() n=0
+  while read -r st snap rec fresh done want; do
+    [[ -n "${st}" && "${st}" != \#* ]] || continue
+    n=$((n + 1))
+    got="$(decide_startup_action RUNNING "${st}" "${snap}" "${rec}" "${fresh}" "${done}")"
+    [[ "${got}" == "${want}" ]] || failures+=("RUNNING ${st} snap=${snap} recreated=${rec} fresh=${fresh} done=${done}: got '${got}', want '${want}'")
+  done <<'TABLE'
+# STATUS        SNAP  RECREATED FRESH DONE  EXPECTED
+  HIBERNATED     true  false     true  false load
+  HIBERNATED     true  false     false false refuse_stale
+  HIBERNATED     true  true      false false refuse_stale
+  HIBERNATED     false false     false false mark_active
+  HIBERNATED     true  false     true  true  load
+  RESTORING      true  false     true  false load
+  RESTORING      true  false     false false refuse_stale
+  RESTORING      true  false     true  true  mark_restored
+  RESTORING      true  false     false true  mark_restored
+  RESTORING      false false     true  true  mark_active
+  SNAPSHOT_SAVED true  false     true  false mark_active
+  SNAPSHOT_SAVED true  false     false false mark_active
+  SNAPSHOT_SAVED true  true      true  false load
+  SNAPSHOT_SAVED true  true      false false refuse_stale
+  SNAPSHOT_SAVED false true      true  false mark_active
+  ACTIVE         true  true      false false noop
+  NONE           true  true      true  false noop
+TABLE
+  assert_eq "${n}" 17 "rows"
+  if ((${#failures[@]})); then
+    printf '%s\n' "${failures[@]}" >&2
+    return 1
+  fi
+  # The 3-argument form keeps the original behaviour.
+  assert_eq "$(decide_startup_action RUNNING SNAPSHOT_SAVED true)" mark_active
+  assert_eq "$(decide_startup_action RUNNING HIBERNATED true)" load
+}
+
+@test "decide_restore_point: full table" {
+  local st rec fresh done latest want got failures=() n=0
+  while read -r st rec fresh done latest want; do
+    [[ -n "${st}" && "${st}" != \#* ]] || continue
+    n=$((n + 1))
+    got="$(decide_restore_point "${st}" "${rec}" "${fresh}" "${done}" "${latest}")"
+    [[ "${got}" == "${want}" ]] || failures+=("${st} recreated=${rec} fresh=${fresh} done=${done} latest=${latest}: got '${got}', want '${want}'")
+  done <<'TABLE'
+# STATUS        RECREATED FRESH DONE  LATEST EXPECTED
+  NONE           false     true  false false  replace
+  NONE           true      true  false true   replace
+  ACTIVE         false     true  false true   replace
+  ACTIVE         true      false false true   replace
+  SNAPSHOT_SAVED false     true  false true   replace
+  SNAPSHOT_SAVED true      true  false true   keep
+  SNAPSHOT_SAVED true      false false true   replace_stale
+  HIBERNATED     false     true  false true   keep
+  HIBERNATED     false     false false true   replace_stale
+  HIBERNATED     false     true  false false  replace
+  RESTORING      false     true  false true   keep
+  RESTORING      false     false false true   replace_stale
+  RESTORING      false     true  true  true   replace
+  RESTORING      false     false true  true   replace
+TABLE
+  assert_eq "${n}" 14 "rows"
+  if ((${#failures[@]})); then
+    printf '%s\n' "${failures[@]}" >&2
+    return 1
+  fi
+}
+
+@test "env_is_fresh / env_recreated_since_snapshot read the describe output and the newest snapshot" {
+  local f="${OPT_WORK_DIR}/state/composer-dev-describe.json"
+  manifest_new composer-dev >"$(manifest_local_path composer-dev)"
+  jq -n --arg t "$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%S.123456Z)" '{uuid: "u-2", createTime: $t}' >"${f}"
+  env_is_fresh composer-dev
+  HIBERNATE_FRESH_ENV_HOURS=1
+  ! env_is_fresh composer-dev
+  jq '.createTime = "not-a-date"' "${f}" >"${f}.t" && mv "${f}.t" "${f}"
+  env_is_fresh composer-dev # unknown creation time counts as fresh
+
+  ! env_recreated_since_snapshot composer-dev # no snapshot uuid recorded
+  manifest_update composer-dev '.snapshots = [{path: "gs://b/s1", environment_uuid: "u-1"}]'
+  env_recreated_since_snapshot composer-dev
+  manifest_update composer-dev '.snapshots[0].environment_uuid = "u-2"'
+  ! env_recreated_since_snapshot composer-dev
+}
+
+@test "restore_attempt_state: SUCCEEDED / FAILED / RUNNING only for the described environment and restore point" {
+  manifest_new composer-dev >"$(manifest_local_path composer-dev)"
+  echo '{"uuid": "u-1"}' >"${OPT_WORK_DIR}/state/composer-dev-describe.json"
+  assert_eq "$(restore_attempt_state composer-dev)" NONE "nothing recorded"
+  manifest_update composer-dev '.latest_snapshot = {path: "gs://b/s1"}
+    | .restore_attempt = {operation: "projects/p/locations/r/operations/op-load-1", snapshot: "gs://b/s1", environment_uuid: "u-1"}'
+  t_reply operation.1 0 '{"name": "op-load-1", "done": true, "response": {}}'
+  t_reply operation.2 0 '{"name": "op-load-1", "done": true, "error": {"code": 13, "message": "boom"}}'
+  t_reply operation.3 0 '{"name": "op-load-1", "done": false}'
+  assert_eq "$(restore_attempt_state composer-dev)" SUCCEEDED
+  assert_eq "$(restore_attempt_state composer-dev)" FAILED
+  assert_eq "$(restore_attempt_state composer-dev)" RUNNING
+  assert_eq "$(t_calls "composer operations describe op-load-1 --location=europe-west2 --project=hib-test-project")" 3
+  echo '{"uuid": "u-other"}' >"${OPT_WORK_DIR}/state/composer-dev-describe.json"
+  assert_eq "$(restore_attempt_state composer-dev)" NONE "re-created environment"
+  echo '{"uuid": "u-1"}' >"${OPT_WORK_DIR}/state/composer-dev-describe.json"
+  manifest_update composer-dev '.latest_snapshot.path = "gs://b/s2"'
+  assert_eq "$(restore_attempt_state composer-dev)" NONE "a newer restore point"
+  assert_eq "$(t_count operation)" 3 "no API call when it cannot apply"
+}
+
+@test "init_work_dir: refuses a directory holding an earlier run's bookkeeping" {
+  local d="${BATS_TEST_TMPDIR}/reused" sub
+  mkdir -p "${d}/logs"
+  echo old >"${d}/logs/x.log"
+  OPT_WORK_DIR="${d}"
+  init_work_dir shutdown 2>/dev/null # logs only: fine
+  for sub in actions state results plans; do
+    rm -rf "${d}"
+    mkdir -p "${d}/${sub}"
+    touch "${d}/${sub}/composer-dev.marker"
+    OPT_WORK_DIR="${d}"
+    run init_work_dir shutdown
+    assert_status 2
+    assert_contains "${output}" "already holds the files of an earlier run (${sub}/)"
+  done
+}
+
+@test "check_environment_eligible: two keys resolving to the same environment both fail" {
+  jq '."composer-test".environment_name = "composer-dev" | ."composer-test".project_id = "hib-test-project"
+      | ."composer-test".region = "europe-west2"' "${UNIT}/resolved.json" >"${RESOLVED_JSON}"
+  run check_environment_eligible composer-dev
+  assert_status 1
+  assert_contains "${output}" "environment composer-dev in hib-test-project/europe-west2 is also defined by: composer-test"
+  run check_environment_eligible composer-test
+  assert_status 1
+  assert_contains "${output}" "also defined by: composer-dev"
+}
+
+@test "plan_deletes_identity: the deleted object must be the expected environment" {
+  local plan="${BATS_TEST_TMPDIR}/identity.json"
+  jq -n --arg a "${DEV_ENV}" '{resource_changes: [{address: $a, change: {actions: ["delete"],
+    before: {project: "hib-test-project", region: "europe-west2", name: "composer-dev"}}}]}' >"${plan}"
+  run plan_deletes_identity "${plan}" "${DEV_ENV}" hib-test-project/europe-west2/composer-dev
+  assert_status 0
+  run plan_deletes_identity "${plan}" "${DEV_ENV}" hib-test-project/europe-west2/composer-qa
+  assert_status 1
+  assert_contains "${output}" "would remove hib-test-project/europe-west2/composer-dev, expected hib-test-project/europe-west2/composer-qa"
+  run plan_deletes_identity "${plan}" "${TEST_ENV}" hib-test-project/europe-west2/composer-test
+  assert_status 1
+  assert_contains "${output}" "would remove <nothing>"
+}
+
+@test "gcs_delete_prefix: 0 deleted, 3 already gone, other failures pass stderr through" {
+  t_reply storage-rm.1 0 ""
+  run gcs_delete_prefix gs://b/snap/
+  assert_status 0
+  assert_eq "$(t_calls "storage rm --recursive gs://b/snap/ --quiet")" 1
+  t_reply storage-rm.2 1 "" "ERROR: (gcloud.storage.rm) The following URLs matched no objects or files:
+-gs://b/snap/"
+  run --separate-stderr gcs_delete_prefix gs://b/snap
+  assert_status 3
+  assert_eq "${stderr}" ""
+  t_reply storage-rm.3 1 "" "ERROR: (gcloud.storage.rm) HTTPError 403: denied"
+  run --separate-stderr gcs_delete_prefix gs://b/snap
+  assert_status 1
+  assert_contains "${stderr}" "HTTPError 403"
+}
+
+@test "ensure_snapshot_bucket: an existing unconditional binding is not granted again" {
+  local sa=composer-dev-sa@hib-test-project.iam.gserviceaccount.com
+  mkdir -p "${STUB_DIR}/gcs/hib-test-project-composer-snapshots"
+  t_reply iam 0 ""
+  t_reply iam-get.1 0 "{\"bindings\": [{\"role\": \"roles/storage.objectAdmin\", \"members\": [\"serviceAccount:${sa}\"]}]}"
+  run ensure_snapshot_bucket composer-dev "${sa}"
+  assert_status 0
+  assert_contains "${output}" "already has roles/storage.objectAdmin"
+  assert_eq "$(t_calls add-iam-policy-binding)" 0
+  # A conditional binding does not count; neither does another role.
+  t_reply iam-get.2 0 "{\"bindings\": [{\"role\": \"roles/storage.objectAdmin\", \"members\": [\"serviceAccount:${sa}\"], \"condition\": {\"title\": \"t\"}}, {\"role\": \"roles/storage.objectViewer\", \"members\": [\"serviceAccount:${sa}\"]}]}"
+  run ensure_snapshot_bucket composer-dev "${sa}"
+  assert_status 0
+  assert_eq "$(t_calls add-iam-policy-binding)" 1
+  # Unreadable policy: fall back to granting.
+  t_reply iam-get.3 1 "" "ERROR: denied"
+  run ensure_snapshot_bucket composer-dev "${sa}"
+  assert_status 0
+  assert_eq "$(t_calls add-iam-policy-binding)" 2
+  [[ ! -d "${OPT_WORK_DIR}/locks/bucket-iam-hib-test-project-composer-snapshots.lock" ]]
+}
+
+@test "with_lock: serialises, releases on failure, times out" {
+  run with_lock demo false
+  assert_status 1
+  [[ ! -d "${OPT_WORK_DIR}/locks/demo.lock" ]]
+  mkdir -p "${OPT_WORK_DIR}/locks/demo.lock"
+  HIBERNATE_LOCK_TIMEOUT_SECONDS=0
+  run with_lock demo true
+  assert_status 1
+  assert_contains "${output}" "timed out after 0s waiting for lock"
+}
+
+@test "wait_for_operation: failed polls are retried within the grace period, then given up" {
+  t_reply operation.1 1 "" "ERROR: UNAVAILABLE"
+  t_reply operation.2 1 "" "ERROR: UNAVAILABLE"
+  t_reply operation.3 1 "" "ERROR: UNAVAILABLE"
+  t_reply operation.4 1 "" "ERROR: UNAVAILABLE"
+  t_reply operation 0 "${SAVE_DONE}"
+  HIBERNATE_POLL_FAILURE_GRACE_SECONDS=60
+  run --separate-stderr wait_for_operation projects/p/locations/r/operations/op-save-1 europe-west2 hib-test-project "unit op"
+  assert_status 0
+  assert_contains "${stderr}" "could not poll operation projects/p/locations/r/operations/op-save-1; trying again"
+  assert_eq "$(t_count operation)" 5
+
+  rm -rf "${STUB_DIR}/replies" "${STUB_DIR}/operation.count"
+  mkdir -p "${STUB_DIR}/replies"
+  t_reply operation 1 "" "ERROR: UNAVAILABLE"
+  HIBERNATE_POLL_FAILURE_GRACE_SECONDS=0
+  run --separate-stderr wait_for_operation projects/p/locations/r/operations/op-save-1 europe-west2 hib-test-project "unit op"
+  assert_status 1
+  assert_contains "${stderr}" "it may still be running server-side"
+}
+
+@test "composer_snapshot_save: records the accepted operation for the caller" {
+  t_reply save 0 "${SAVE_OP}"
+  t_reply operation 1 "" "ERROR: UNAVAILABLE"
+  run --separate-stderr composer_snapshot_save composer-dev europe-west2 hib-test-project gs://snaps/p "${BATS_TEST_TMPDIR}/op"
+  assert_status 1
+  assert_eq "$(cat "${BATS_TEST_TMPDIR}/op")" "projects/hib-test-project/locations/europe-west2/operations/op-save-1"
+}
+
+@test "composer_snapshot_load: ON_STARTED gets every accepted operation" {
+  t_reply load 0 '{"name": "projects/p/locations/r/operations/op-load-7", "done": false}'
+  t_reply operation 0 '{"name": "op-load-7", "done": true, "response": {}}'
+  record() { printf '%s %s\n' "$1" "$2" >>"${BATS_TEST_TMPDIR}/started"; }
+  run --separate-stderr composer_snapshot_load composer-dev europe-west2 hib-test-project gs://b/s \
+    '{"skip_pypi_packages_installation": true}' record composer-dev
+  assert_status 0
+  assert_eq "$(cat "${BATS_TEST_TMPDIR}/started")" "composer-dev projects/p/locations/r/operations/op-load-7"
 }

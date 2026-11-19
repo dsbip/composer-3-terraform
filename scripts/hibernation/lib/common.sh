@@ -46,6 +46,15 @@ HIB_RC_NOT_FOUND=3
 : "${HIBERNATE_LOAD_ATTEMPTS:=2}"              # a retried load resumes a partial one
 : "${HIBERNATE_SKIP_IMAGE_CHECK:=false}"       # skip the "can it be recreated?" check
 : "${HIBERNATE_COMPOSER_API:=https://composer.googleapis.com}"
+# How long polling a running snapshot/load operation may keep failing (API or
+# network outage) before the wait is abandoned; the deadline still applies.
+: "${HIBERNATE_POLL_FAILURE_GRACE_SECONDS:=900}"
+# An environment found RUNNING while its state file says it is hibernated was
+# re-created outside the hibernation cycle (e.g. a deploy at night). Up to
+# this age it is treated as new and empty (the snapshot is loaded into it /
+# kept as the restore point); an older one is assumed to hold real work.
+: "${HIBERNATE_FRESH_ENV_HOURS:=96}"
+: "${HIBERNATE_LOCK_TIMEOUT_SECONDS:=600}"     # job-local locks (bucket IAM)
 
 export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 
@@ -111,10 +120,37 @@ retry() {
       rm -f "${out}"
       return "${rc}"
     fi
-    warn "attempt ${attempt}/${HIBERNATE_GCLOUD_RETRIES} failed (rc=${rc}): $*; retrying in ${HIBERNATE_RETRY_SLEEP_SECONDS}s"
-    sleep "${HIBERNATE_RETRY_SLEEP_SECONDS}"
+    # Jitter, so parallel environments retrying the same call drift apart.
+    local pause=$((HIBERNATE_RETRY_SLEEP_SECONDS + RANDOM % (HIBERNATE_RETRY_SLEEP_SECONDS / 2 + 1)))
+    warn "attempt ${attempt}/${HIBERNATE_GCLOUD_RETRIES} failed (rc=${rc}): $*; retrying in ${pause}s"
+    sleep "${pause}"
     attempt=$((attempt + 1))
   done
+}
+
+# with_lock NAME COMMAND... — runs COMMAND while holding a lock shared by all
+# sub-shells of this run (mkdir is atomic; no flock dependency).
+with_lock() {
+  local dir="${OPT_WORK_DIR}/locks/$1.lock" waited=0 rc
+  shift
+  mkdir -p "${OPT_WORK_DIR}/locks"
+  until mkdir "${dir}" 2>/dev/null; do
+    if ((waited >= HIBERNATE_LOCK_TIMEOUT_SECONDS)); then
+      error "timed out after ${waited}s waiting for lock ${dir}"
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  "$@" && rc=0 || rc=$?
+  rmdir "${dir}" 2>/dev/null || true
+  return "${rc}"
+}
+
+# rfc3339_epoch TIMESTAMP -> seconds since epoch (empty when unparsable)
+rfc3339_epoch() {
+  [[ -n "$1" ]] || return 0
+  date -u -d "$1" +%s 2>/dev/null || true
 }
 
 # True when a gcloud error text means "the resource does not exist".
@@ -190,7 +226,7 @@ is_safe_orphan_bucket() {
 # ── Option parsing (shared) ─────────────────────────────────────────────────
 # Populates: OPT_CONFIG OPT_ENVS[] OPT_DRY_RUN OPT_SKIP_INIT OPT_WORK_DIR
 #            OPT_VAR_FILES[] OPT_FORCE_NO_SNAPSHOT OPT_ALLOW_INITIAL_CREATE
-#            OPT_SKIP_LOAD
+#            OPT_SKIP_LOAD OPT_FORCE_LOAD
 OPT_CONFIG="${HIBERNATE_CONFIG_FILE:-}"
 OPT_ENVS=()
 OPT_DRY_RUN=false
@@ -200,18 +236,18 @@ OPT_VAR_FILES=()
 OPT_FORCE_NO_SNAPSHOT=false
 OPT_ALLOW_INITIAL_CREATE=false
 OPT_SKIP_LOAD=false
+OPT_FORCE_LOAD=false
 
+# Command-line options take precedence over (replace) the corresponding
+# HIBERNATE_* environment variables. An explicit selection that names no
+# environment (--env '', HIBERNATE_ENVIRONMENTS=',') is refused: falling back
+# to "every enabled environment" would hibernate other teams' environments.
 parse_common_args() {
   local mode="$1"
   shift
-  if [[ -n "${HIBERNATE_ENVIRONMENTS:-}" ]]; then
-    mapfile -t OPT_ENVS < <(split_words "${HIBERNATE_ENVIRONMENTS}")
-  fi
+  local cli_envs=() cli_envs_given=false cli_var_files=() cli_var_files_given=false value n
   is_true "${HIBERNATE_DRY_RUN:-false}" && OPT_DRY_RUN=true
   is_true "${HIBERNATE_SKIP_INIT:-false}" && OPT_SKIP_INIT=true
-  if [[ -n "${HIBERNATE_TF_VAR_FILES:-}" ]]; then
-    mapfile -t OPT_VAR_FILES < <(split_words "${HIBERNATE_TF_VAR_FILES}")
-  fi
 
   while (($#)); do
     case "$1" in
@@ -224,22 +260,29 @@ parse_common_args() {
       OPT_CONFIG="${1#*=}"
       shift
       ;;
-    -e | --env)
-      [[ $# -ge 2 ]] || die "$1 needs a value"
-      mapfile -t -O "${#OPT_ENVS[@]}" OPT_ENVS < <(split_words "$2")
-      shift 2
-      ;;
-    --env=*)
-      mapfile -t -O "${#OPT_ENVS[@]}" OPT_ENVS < <(split_words "${1#*=}")
-      shift
+    -e | --env | --env=*)
+      if [[ "$1" == --env=* ]]; then
+        value="${1#*=}"
+        shift
+      else
+        [[ $# -ge 2 ]] || die "$1 needs a value"
+        value="$2"
+        shift 2
+      fi
+      n=${#cli_envs[@]}
+      mapfile -t -O "${n}" cli_envs < <(split_words "${value}")
+      ((${#cli_envs[@]} > n)) || die "--env '${value}' names no environment"
+      cli_envs_given=true
       ;;
     --var-file)
       [[ $# -ge 2 ]] || die "$1 needs a value"
-      OPT_VAR_FILES+=("$2")
+      cli_var_files+=("$2")
+      cli_var_files_given=true
       shift 2
       ;;
     --var-file=*)
-      OPT_VAR_FILES+=("${1#*=}")
+      cli_var_files+=("${1#*=}")
+      cli_var_files_given=true
       shift
       ;;
     --work-dir)
@@ -274,6 +317,11 @@ parse_common_args() {
       OPT_SKIP_LOAD=true
       shift
       ;;
+    --force-load)
+      [[ "${mode}" == startup ]] || die "$1 is only valid for composer-startup.sh"
+      OPT_FORCE_LOAD=true
+      shift
+      ;;
     -h | --help)
       usage
       exit 0
@@ -285,16 +333,39 @@ parse_common_args() {
     esac
   done
 
+  if [[ "${cli_envs_given}" == true ]]; then
+    OPT_ENVS=("${cli_envs[@]}")
+  elif [[ -n "${HIBERNATE_ENVIRONMENTS+set}" ]]; then
+    mapfile -t OPT_ENVS < <(split_words "${HIBERNATE_ENVIRONMENTS}")
+    ((${#OPT_ENVS[@]})) ||
+      die "HIBERNATE_ENVIRONMENTS is set but names no environment; unset (delete) it to select every environment with hibernation.enabled: true"
+  fi
+  if [[ "${cli_var_files_given}" == true ]]; then
+    OPT_VAR_FILES=("${cli_var_files[@]}")
+  elif [[ -n "${HIBERNATE_TF_VAR_FILES:-}" ]]; then
+    mapfile -t OPT_VAR_FILES < <(split_words "${HIBERNATE_TF_VAR_FILES}")
+  fi
+  [[ "${OPT_SKIP_LOAD}" != true || "${OPT_FORCE_LOAD}" != true ]] || die "--skip-load and --force-load are mutually exclusive"
   [[ -n "${OPT_CONFIG}" ]] || die "--config (or HIBERNATE_CONFIG_FILE) is required"
 }
 
 # ── Work directory (logs, plans, manifests, summary — kept as CI artifacts) ─
+# The per-environment bookkeeping (actions/, state/, results/) drives the
+# run, so a directory still holding an earlier run's files is refused:
+# stale phase markers would otherwise delete an environment whose snapshot
+# just failed, or skip a load.
 init_work_dir() {
-  local mode="$1"
+  local mode="$1" d
   if [[ -z "${OPT_WORK_DIR}" ]]; then
     OPT_WORK_DIR="${TF_ROOT}/.hibernation/${mode}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   fi
-  mkdir -p "${OPT_WORK_DIR}/logs" "${OPT_WORK_DIR}/plans" "${OPT_WORK_DIR}/state" "${OPT_WORK_DIR}/results"
+  for d in actions state results plans; do
+    if [[ -d "${OPT_WORK_DIR}/${d}" && -n "$(ls -A "${OPT_WORK_DIR}/${d}" 2>/dev/null)" ]]; then
+      die "work dir ${OPT_WORK_DIR} already holds the files of an earlier run (${d}/); use a new or empty --work-dir / HIBERNATE_WORK_DIR for every run"
+    fi
+  done
+  mkdir -p "${OPT_WORK_DIR}/logs" "${OPT_WORK_DIR}/plans" "${OPT_WORK_DIR}/state" "${OPT_WORK_DIR}/results" \
+    "${OPT_WORK_DIR}/actions"
   OPT_WORK_DIR="$(cd "${OPT_WORK_DIR}" && pwd)"
   info "work dir: ${OPT_WORK_DIR}"
 }
@@ -386,6 +457,18 @@ check_environment_eligible() {
   prod="$(setting "${key}" .is_production)"
   if [[ "${prod}" == true ]]; then
     error "[${key}] refusing to hibernate a production environment"
+    return 1
+  fi
+  # Two keys resolving to the same environment would snapshot one, delete the
+  # other and share one state file.
+  local others
+  others="$(jq -r --arg k "${key}" '
+    .[$k] as $me
+    | [to_entries[] | select(.key != $k and .value.project_id == $me.project_id
+        and .value.region == $me.region and .value.environment_name == $me.environment_name) | .key]
+    | join(", ")' "${RESOLVED_JSON}")"
+  if [[ -n "${others}" ]]; then
+    error "[${key}] environment $(setting "${key}" .environment_name) in $(setting "${key}" .project_id)/$(setting "${key}" .region) is also defined by: ${others}"
     return 1
   fi
   return 0
@@ -537,14 +620,23 @@ wait_for_composer_state() {
 # JSON. Returns 1 on operation error or timeout.
 wait_for_operation() {
   local op_name="$1" region="$2" project="$3" what="$4"
-  local op_id="${op_name##*/}" deadline op done_flag
+  local op_id="${op_name##*/}" deadline op done_flag failing_since=""
   deadline=$(($(now_epoch) + HIBERNATE_OPERATION_TIMEOUT_MINUTES * 60))
   while :; do
-    op="$(retry gcloud composer operations describe "${op_id}" --location="${region}" \
-      --project="${project}" --format=json)" || {
-      error "could not poll operation ${op_name}"
-      return 1
-    }
+    if ! op="$(retry gcloud composer operations describe "${op_id}" --location="${region}" \
+      --project="${project}" --format=json)"; then
+      # A failed poll says nothing about the operation itself: keep polling
+      # through an API/network outage, within a grace period and the deadline.
+      failing_since="${failing_since:-$(now_epoch)}"
+      if (($(now_epoch) - failing_since >= HIBERNATE_POLL_FAILURE_GRACE_SECONDS || $(now_epoch) >= deadline)); then
+        error "could not poll operation ${op_name} for $(($(now_epoch) - failing_since))s; it may still be running server-side"
+        return 1
+      fi
+      warn "could not poll operation ${op_name}; trying again in ${HIBERNATE_POLL_SECONDS}s"
+      sleep "${HIBERNATE_POLL_SECONDS}"
+      continue
+    fi
+    failing_since=""
     done_flag="$(jq -r '.done // false' <<<"${op}")"
     if [[ "${done_flag}" == true ]]; then
       if jq -e '.error' <<<"${op}" >/dev/null; then
@@ -569,7 +661,7 @@ wait_for_operation() {
 # .snapshotPath) — never guessed from folder names. A request rejected because
 # another operation is running is retried once after the environment settles.
 composer_snapshot_save() {
-  local name="$1" region="$2" project="$3" location="$4" op op_name result path err attempt
+  local name="$1" region="$2" project="$3" location="$4" op_file="${5:-}" op op_name result path err attempt
   err="$(mktemp)"
   for attempt in 1 2; do
     op="$(gcloud composer environments snapshots save "${name}" --location="${region}" \
@@ -591,6 +683,8 @@ composer_snapshot_save() {
     return 1
   }
   info "snapshot of ${name} started (operation ${op_name})"
+  # Lets the caller track a save that is abandoned while still running.
+  [[ -z "${op_file}" ]] || printf '%s\n' "${op_name}" >"${op_file}"
   result="$(wait_for_operation "${op_name}" "${region}" "${project}" "snapshot save of ${name}")" || return 1
   path="$(jq -r '.response.snapshotPath // empty' <<<"${result}")"
   path="${path%/}"
@@ -609,9 +703,12 @@ snapshot_is_complete() {
   grep -q '\.sql\.gz$' <<<"${out}"
 }
 
-# composer_snapshot_load NAME REGION PROJECT SNAPSHOT_PATH LOAD_OPTIONS_JSON
+# composer_snapshot_load NAME REGION PROJECT SNAPSHOT_PATH LOAD_OPTIONS_JSON [ON_STARTED...]
+# ON_STARTED (a command) is run with the operation name appended each time a
+# load operation has been accepted, so it can be recorded.
 composer_snapshot_load() {
   local name="$1" region="$2" project="$3" path="$4" opts="$5" op op_name
+  local on_started=("${@:6}")
   local args=(--location="${region}" --project="${project}" --snapshot-path="${path}" --async --format=json)
   [[ "$(jq -r '.skip_pypi_packages_installation' <<<"${opts}")" == true ]] && args+=(--skip-pypi-packages-installation)
   [[ "$(jq -r '.skip_environment_variables_setting' <<<"${opts}")" == true ]] && args+=(--skip-environment-variables-setting)
@@ -620,10 +717,15 @@ composer_snapshot_load() {
   info "loading ${path} into ${name} (${args[*]:3})"
   local attempt
   for ((attempt = 1; attempt <= HIBERNATE_LOAD_ATTEMPTS; attempt++)); do
-    if op="$(gcloud composer environments snapshots load "${name}" "${args[@]}")" &&
-      op_name="$(jq -r '.name // empty' <<<"${op}")" && [[ -n "${op_name}" ]] &&
-      wait_for_operation "${op_name}" "${region}" "${project}" "snapshot load into ${name}" >/dev/null; then
-      return 0
+    op_name=""
+    if op="$(gcloud composer environments snapshots load "${name}" "${args[@]}")"; then
+      op_name="$(jq -r '.name // empty' <<<"${op}" 2>/dev/null)" || op_name=""
+    fi
+    if [[ -n "${op_name}" ]]; then
+      ((${#on_started[@]} == 0)) || "${on_started[@]}" "${op_name}" || true
+      if wait_for_operation "${op_name}" "${region}" "${project}" "snapshot load into ${name}" >/dev/null; then
+        return 0
+      fi
     fi
     if ((attempt < HIBERNATE_LOAD_ATTEMPTS)); then
       # Composer skips the steps a partially completed load already did.
@@ -640,7 +742,24 @@ composer_snapshot_load() {
 # in a location (Composer REST API; GA gcloud has no listing command). The
 # access token is handed to curl on stdin, never on the command line.
 list_creatable_image_versions() {
-  local project="$1" region="$2" token page="" url out
+  _image_versions_query "$1" "$2" '.imageVersions[]? | select(.creationDisabled != true) | .imageVersionId'
+}
+
+# The image GCP uses when an environment is created without image_version.
+default_image_version() {
+  local out
+  out="$(_image_versions_query "$1" "$2" '.imageVersions[]? | select(.isDefault == true and .creationDisabled != true) | .imageVersionId')" || return 1
+  out="$(sed -n 1p <<<"${out}")"
+  [[ -n "${out}" ]] || {
+    error "the image version listing for $1/$2 names no default image"
+    return 1
+  }
+  printf '%s\n' "${out}"
+}
+
+# _image_versions_query PROJECT REGION JQ_FILTER — runs JQ_FILTER on every page.
+_image_versions_query() {
+  local project="$1" region="$2" filter="$3" token page="" url out
   token="$(gcloud auth print-access-token 2>/dev/null)" || {
     error "could not obtain an access token from gcloud"
     return 1
@@ -656,7 +775,7 @@ list_creatable_image_versions() {
       error "unexpected (non-JSON) image version listing for ${project}/${region}"
       return 1
     }
-    jq -r '.imageVersions[]? | select(.creationDisabled != true) | .imageVersionId' <<<"${out}"
+    jq -r "${filter}" <<<"${out}"
     page="$(jq -r '.nextPageToken // empty' <<<"${out}")"
     [[ -n "${page}" ]] || break
   done
@@ -695,8 +814,29 @@ check_restorable() {
   local key="$1" current="$2" restore project region cache_key list
   RESTORE_REASON=""
   restore="$(restore_image_version "${key}" "${current}")"
+  project="$(setting "${key}" .project_id)"
+  region="$(setting "${key}" .region)"
   if [[ -z "${restore}" ]]; then
-    warn "[${key}] restore will use GCP's default image (no image_version in YAML, pin_image_version: false); snapshot compatibility cannot be checked in advance"
+    # No image_version in the YAML and pin_image_version: false — the restore
+    # creates on GCP's default image, so that one must be able to load it.
+    if is_true "${HIBERNATE_SKIP_IMAGE_CHECK}"; then
+      warn "[${key}] HIBERNATE_SKIP_IMAGE_CHECK set: the restore uses GCP's default image, not checked"
+      return 0
+    fi
+    local default
+    default="$(default_image_version "${project}" "${region}")" || {
+      RESTORE_REASON="could not determine GCP's default image, which the restore would use (no image_version in the YAML, pin_image_version: false); set HIBERNATE_SKIP_IMAGE_CHECK=true to bypass"
+      return 1
+    }
+    if [[ "${default}" != composer-3-airflow-* ]]; then
+      RESTORE_REASON="the restore would use GCP's default image ${default}, which is not a Composer 3 image — set software_config.image_version (or hibernation.pin_image_version: true)"
+      return 1
+    fi
+    if [[ -n "${current}" ]] && ! airflow_version_satisfies "$(airflow_version_of "${default}")" "$(airflow_version_of "${current}")"; then
+      RESTORE_REASON="the restore would use GCP's default image ${default}, which cannot load a snapshot of the running ${current} — set software_config.image_version (or hibernation.pin_image_version: true)"
+      return 1
+    fi
+    info "[${key}] restore will use GCP's default image ${default} (no image_version in the YAML, pin_image_version: false)"
     return 0
   fi
   if [[ -n "${current}" ]] && ! airflow_version_satisfies "$(airflow_version_of "${restore}")" "$(airflow_version_of "${current}")"; then
@@ -707,8 +847,6 @@ check_restorable() {
     warn "[${key}] HIBERNATE_SKIP_IMAGE_CHECK set: not checking that ${restore} is still creatable"
     return 0
   fi
-  project="$(setting "${key}" .project_id)"
-  region="$(setting "${key}" .region)"
   cache_key="${project}/${region}"
   if [[ -z "${_CREATABLE_CACHE[${cache_key}]:-}" ]]; then
     list="$(list_creatable_image_versions "${project}" "${region}")" || {
@@ -766,8 +904,18 @@ gcs_list_prefixes() {
   grep '/$' <<<"${out}" || true
 }
 
+# gcs_delete_prefix URL -> 0 deleted, 3 nothing there (already gone), other = error
 gcs_delete_prefix() {
-  gcloud storage rm --recursive "${1%/}/" --quiet >/dev/null
+  local err rc
+  err="$(mktemp)"
+  gcloud storage rm --recursive "${1%/}/" --quiet >/dev/null 2>"${err}" && rc=0 || rc=$?
+  if ((rc != 0)) && is_not_found_error "$(cat "${err}")"; then
+    rc="${HIB_RC_NOT_FOUND}"
+  elif ((rc != 0)); then
+    cat "${err}" >&2
+  fi
+  rm -f "${err}"
+  return "${rc}"
 }
 
 # bucket_exists NAME -> 0 exists, 3 missing, other = error
@@ -826,17 +974,33 @@ ensure_snapshot_bucket() {
   fi
 
   if [[ -n "${sa}" ]]; then
-    info "[${key}] granting roles/storage.objectAdmin on gs://${bucket} to ${sa}"
-    retry gcloud storage buckets add-iam-policy-binding "gs://${bucket}" \
-      --member="serviceAccount:${sa}" --role=roles/storage.objectAdmin --quiet >/dev/null || {
-      error "[${key}] could not grant ${sa} access to gs://${bucket}"
-      return 1
-    }
+    # Parallel environments share the bucket and every IAM write is a
+    # read-modify-write on its policy (stale etag -> HTTP 412), so the grant
+    # is skipped when already present and serialised within the run.
+    with_lock "bucket-iam-${bucket}" grant_bucket_object_admin "${key}" "${bucket}" "${sa}"
   fi
+}
+
+grant_bucket_object_admin() {
+  local key="$1" bucket="$2" sa="$3" policy
+  if policy="$(gcloud storage buckets get-iam-policy "gs://${bucket}" --format=json 2>/dev/null)" &&
+    jq -e --arg m "serviceAccount:${sa}" \
+      '[.bindings[]? | select(.role == "roles/storage.objectAdmin" and .condition == null) | .members[]?] | index($m) != null' \
+      >/dev/null 2>&1 <<<"${policy}"; then
+    info "[${key}] ${sa} already has roles/storage.objectAdmin on gs://${bucket}"
+    return 0
+  fi
+  info "[${key}] granting roles/storage.objectAdmin on gs://${bucket} to ${sa}"
+  retry gcloud storage buckets add-iam-policy-binding "gs://${bucket}" \
+    --member="serviceAccount:${sa}" --role=roles/storage.objectAdmin --quiet >/dev/null || {
+    error "[${key}] could not grant ${sa} access to gs://${bucket}"
+    return 1
+  }
 }
 
 # ── Hibernation state file (manifest) ──────────────────────────────────────
 # Lives at <snapshot_location>/hibernation-state.json. Status values:
+#   NONE            no state file yet (never hibernated)
 #   SNAPSHOT_SAVED  snapshot taken, environment deletion not confirmed yet
 #   HIBERNATED      environment deleted; latest_snapshot must be restored
 #   RESTORING       startup in progress (environment created and/or loading)
@@ -998,6 +1162,44 @@ tf_resource_in_state() {
   grep -Fxq "$(tf_address "$1")" <<<"${TF_STATE_LIST}"
 }
 
+# "project/region/name" the YAML resolves KEY to.
+settings_identity() {
+  printf '%s/%s/%s\n' "$(setting "$1" .project_id)" "$(setting "$1" .region)" "$(setting "$1" .environment_name)"
+}
+
+# tf_state_identity KEY -> "project/region/name" of the Composer environment
+# the Terraform state holds for KEY (empty when absent). Terraform deletes or
+# replaces THAT object, whatever the YAML says now, so it must match before
+# anything is snapshotted or deleted.
+tf_state_identity() {
+  local f="${OPT_WORK_DIR}/tf-state.json"
+  if [[ ! -s "${f}" ]]; then
+    tf show -json >"${f}" 2>"${OPT_WORK_DIR}/logs/state-show.log" || {
+      cat "${OPT_WORK_DIR}/logs/state-show.log" >&2
+      rm -f "${f}"
+      return 1
+    }
+  fi
+  jq -r --arg a "$(tf_address "$1")" '
+    first(.values.root_module? | .. | objects
+      | select(.address? == $a and .mode? == "managed") | .values
+      | "\(.project)/\(.region)/\(.name)") // empty' "${f}"
+}
+
+# check_state_identity KEY — 0 when the state's environment is the YAML's.
+check_state_identity() {
+  local key="$1" got want
+  want="$(settings_identity "${key}")"
+  got="$(tf_state_identity "${key}")" || {
+    error "[${key}] could not read the Terraform state"
+    return 1
+  }
+  if [[ "${got}" != "${want}" ]]; then
+    error "[${key}] $(tf_address "${key}") is ${got:-<absent>} in the Terraform state but the YAML resolves to ${want} (unapplied rename/move, duplicated environment_name or wrong backend?)"
+    return 1
+  fi
+}
+
 # tf_plan NAME [extra terraform plan args...] -> writes plans/NAME.{tfplan,txt,json}
 tf_plan() {
   local name="$1"
@@ -1094,6 +1296,19 @@ plan_must_contain() {
   fi
 }
 
+# plan_deletes_identity PLAN_JSON ADDRESS "project/region/name" — the object a
+# delete/replace removes (change.before) must be the expected environment.
+plan_deletes_identity() {
+  local plan="$1" addr="$2" want="$3" got
+  got="$(jq -r --arg a "${addr}" '
+    first(.resource_changes[]? | select(.address == $a) | .change.before | select(. != null)
+      | "\(.project)/\(.region)/\(.name)") // empty' "${plan}")"
+  if [[ "${got}" != "${want}" ]]; then
+    error "plan guard: ${addr} would remove ${got:-<nothing>}, expected ${want} — refusing to apply"
+    return 1
+  fi
+}
+
 tf_apply_plan() {
   local name="$1" planfile="${OPT_WORK_DIR}/plans/$1.tfplan"
   section_start "apply_${name}" "terraform apply (${name})"
@@ -1139,29 +1354,45 @@ decide_shutdown_action() {
   esac
 }
 
-# decide_startup_action STATE MANIFEST_STATUS HAS_SNAPSHOT
+# decide_startup_action STATE MANIFEST_STATUS HAS_SNAPSHOT [RECREATED] [FRESH] [RESTORE_DONE]
+#   RECREATED     the running environment is not the one last snapshotted
+#                 (different uuid) — only consulted for SNAPSHOT_SAVED
+#   FRESH         the running environment is younger than HIBERNATE_FRESH_ENV_HOURS
+#   RESTORE_DONE  a recorded snapshot load into THIS environment succeeded
 #   prints one of:
 #     create_and_load   environment absent, snapshot available
 #     create_fresh      environment absent, no snapshot (new environment)
 #     replace_and_load  environment broken (ERROR) mid-restore → recreate
 #     load              environment exists but the snapshot was never loaded
+#     mark_restored     the load finished earlier; only the state file lags
 #     mark_active       environment kept running (shutdown never deleted it)
+#     refuse_stale      environment re-created long ago outside the cycle;
+#                       loading would overwrite real work
 #     noop              nothing to do
 #     error:<reason>
 decide_startup_action() {
-  local state="$1" status="$2" has_snapshot="$3"
+  local state="$1" status="$2" has_snapshot="$3" recreated="${4:-false}" fresh="${5:-true}" done="${6:-false}"
   case "${state}" in
   NOT_FOUND)
     if [[ "${has_snapshot}" == true ]]; then echo create_and_load; else echo create_fresh; fi
     ;;
   RUNNING)
-    case "${status}" in
-    HIBERNATED | RESTORING)
-      if [[ "${has_snapshot}" == true ]]; then echo load; else echo mark_active; fi
-      ;;
-    SNAPSHOT_SAVED) echo mark_active ;;
-    *) echo noop ;;
-    esac
+    if [[ "${status}" == HIBERNATED || "${status}" == RESTORING ||
+      ("${status}" == SNAPSHOT_SAVED && "${recreated}" == true) ]]; then
+      if [[ "${has_snapshot}" != true ]]; then
+        echo mark_active
+      elif [[ "${status}" == RESTORING && "${done}" == true ]]; then
+        echo mark_restored
+      elif [[ "${fresh}" == true ]]; then
+        echo load
+      else
+        echo refuse_stale
+      fi
+    elif [[ "${status}" == SNAPSHOT_SAVED ]]; then
+      echo mark_active
+    else
+      echo noop
+    fi
     ;;
   ERROR)
     case "${status}" in
@@ -1177,6 +1408,84 @@ decide_startup_action() {
     ;;
   *) echo "error:environment is in unexpected state ${state}" ;;
   esac
+}
+
+# decide_restore_point STATUS RECREATED FRESH RESTORE_DONE HAS_LATEST
+# Whether the snapshot a shutdown just took of a RUNNING environment becomes
+# the restore point. Prints:
+#   replace        normal: the newest snapshot is the restore point
+#   keep           the environment never received the restore point (an
+#                  incomplete restore, or re-created empty while hibernated):
+#                  keep the old restore point, record the new one as secondary
+#   replace_stale  like keep, but the environment has been running for longer
+#                  than HIBERNATE_FRESH_ENV_HOURS, so it holds real work: the
+#                  new snapshot becomes the restore point
+decide_restore_point() {
+  local status="$1" recreated="$2" fresh="$3" done="$4" has_latest="$5"
+  if [[ "${has_latest}" != true ]]; then
+    echo replace
+  elif [[ "${status}" == RESTORING && "${done}" == true ]]; then
+    echo replace
+  elif [[ "${status}" == RESTORING || "${status}" == HIBERNATED ||
+    ("${status}" == SNAPSHOT_SAVED && "${recreated}" == true) ]]; then
+    if [[ "${fresh}" == true ]]; then echo keep; else echo replace_stale; fi
+  else
+    echo replace
+  fi
+}
+
+# env_is_fresh KEY — the described environment was created less than
+# HIBERNATE_FRESH_ENV_HOURS ago (unknown creation time counts as fresh).
+env_is_fresh() {
+  local created
+  created="$(rfc3339_epoch "$(describe_get "$1" .createTime)")"
+  [[ -z "${created}" ]] && return 0
+  (($(now_epoch) - created < HIBERNATE_FRESH_ENV_HOURS * 3600))
+}
+
+# env_recreated_since_snapshot KEY — the described environment is not the one
+# the newest snapshot was taken of (both uuids must be known).
+env_recreated_since_snapshot() {
+  local now_uuid snap_uuid
+  now_uuid="$(describe_get "$1" .uuid)"
+  snap_uuid="$(manifest_get "$1" '.snapshots[0].environment_uuid')"
+  [[ -n "${now_uuid}" && -n "${snap_uuid}" && "${now_uuid}" != "${snap_uuid}" ]]
+}
+
+# restore_attempt_state KEY -> SUCCEEDED | RUNNING | FAILED | NONE for the
+# snapshot load recorded in the state file, when it targeted the described
+# environment (same uuid) and the current restore point.
+restore_attempt_state() {
+  local key="$1" op uuid snap out
+  op="$(manifest_get "${key}" .restore_attempt.operation)"
+  uuid="$(manifest_get "${key}" .restore_attempt.environment_uuid)"
+  snap="$(manifest_get "${key}" .restore_attempt.snapshot)"
+  if [[ -z "${op}" || -z "${uuid}" || "${uuid}" != "$(describe_get "${key}" .uuid)" ||
+    "${snap}" != "$(manifest_get "${key}" .latest_snapshot.path)" ]]; then
+    echo NONE
+    return 0
+  fi
+  out="$(retry gcloud composer operations describe "${op##*/}" --location="$(setting "${key}" .region)" \
+    --project="$(setting "${key}" .project_id)" --format=json 2>/dev/null)" || {
+    echo NONE
+    return 0
+  }
+  if [[ "$(jq -r '.done // false' <<<"${out}")" != true ]]; then
+    echo RUNNING
+  elif jq -e '.error' >/dev/null <<<"${out}"; then
+    echo FAILED
+  else
+    echo SUCCEEDED
+  fi
+}
+
+# record_restore_attempt KEY SNAPSHOT OPERATION — remembered (and uploaded)
+# before waiting, so a load that finishes after the job gave up is recognised.
+record_restore_attempt() {
+  local key="$1" snapshot="$2" op="$3"
+  manifest_update "${key}" '.restore_attempt = {operation: $op, snapshot: $s, environment_uuid: $u, started_at: $t}' \
+    --arg op "${op}" --arg s "${snapshot}" --arg u "$(describe_get "${key}" .uuid)" --arg t "$(_ts)"
+  manifest_push "${key}" || warn "[${key}] could not record the load operation in the state file"
 }
 
 # Describes the environment once (writing state/<key>-describe.json), waiting
@@ -1222,18 +1531,25 @@ Common options:
   -c, --config FILE        YAML config consumed by the Terraform module (required;
                            or HIBERNATE_CONFIG_FILE). Relative paths are resolved
                            against TF_ROOT, then the current directory.
-  -e, --env KEY[,KEY]      Environment key(s) to process (repeatable; or
+  -e, --env KEY[,KEY]      Environment key(s) to process (repeatable; replaces
                            HIBERNATE_ENVIRONMENTS). Default: every environment
-                           with hibernation.enabled: true.
-  -n, --dry-run            Resolve, inspect and plan only; change nothing.
-      --var-file FILE      Extra -var-file for terraform plan (repeatable; or
-                           HIBERNATE_TF_VAR_FILES).
-      --skip-init          Do not run terraform init (already initialised).
+                           with hibernation.enabled: true. A value naming no
+                           environment is an error.
+  -n, --dry-run            Resolve, inspect and plan only; change nothing
+                           (or HIBERNATE_DRY_RUN=true).
+      --var-file FILE      Extra -var-file for terraform plan (repeatable;
+                           replaces HIBERNATE_TF_VAR_FILES).
+      --skip-init          Do not run terraform init (already initialised;
+                           or HIBERNATE_SKIP_INIT=true).
       --work-dir DIR       Where logs/plans/state copies/summary are written
-                           (default: $TF_ROOT/.hibernation/<mode>-<timestamp>).
+                           (or HIBERNATE_WORK_DIR). Must be new or empty for
+                           every run. Default:
+                           $TF_ROOT/.hibernation/<mode>-<timestamp>-<pid>.
   -h, --help               Show this help.
 
 Environment:
+  HIBERNATE_CONFIG_FILE    same as --config
+  HIBERNATE_ENVIRONMENTS   same as --env (set but empty is an error)
   TF_ROOT                  Terraform root module directory (default: repo root)
   TF_MODULE_ADDRESS        Address of the composer module (default: module.composer)
   TF_BACKEND_BUCKET        GCS bucket for remote state (enables the gcs backend)
@@ -1242,12 +1558,22 @@ Environment:
   HIBERNATE_OPERATION_TIMEOUT_MINUTES  snapshot save/load timeout (default: 90)
   HIBERNATE_WAIT_TIMEOUT_MINUTES       wait for transitional states (default: 60)
   HIBERNATE_POLL_SECONDS               polling interval (default: 30)
+  HIBERNATE_POLL_FAILURE_GRACE_SECONDS keep polling an operation through API
+                                       errors for this long (default: 900)
   HIBERNATE_MAX_PARALLEL               concurrent snapshot/load operations (default: 4)
   HIBERNATE_LOAD_ATTEMPTS              snapshot load attempts (default: 2)
+  HIBERNATE_FRESH_ENV_HOURS            age up to which an environment found running
+                                       while hibernated counts as new/empty (default: 96)
+  HIBERNATE_GCLOUD_RETRIES             attempts per gcloud call (default: 3)
+  HIBERNATE_RETRY_SLEEP_SECONDS        pause between attempts (default: 10, + jitter)
   HIBERNATE_SKIP_IMAGE_CHECK           true = do not verify the restore image is
                                        still creatable before deleting (default: false)
+  HIBERNATE_COMPOSER_API               Composer REST endpoint (image version listing)
 
-Exit codes: 0 success (or nothing to do), 1 one or more environments failed,
-            2 usage/configuration/prerequisite error.
+Exit codes: 0 success (or nothing to do)
+            1 one or more environments failed — including an environment whose
+              own settings are invalid, production or not eligible
+            2 bad arguments, unknown environment key, unreadable YAML, or a
+              terraform init/state prerequisite failed
 EOF
 }

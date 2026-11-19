@@ -6,7 +6,7 @@
 # Composer / auth calls are answered from scripted replies, per call number:
 #   $STUB_DIR/replies/<key>.<n>/{rc,stdout,stderr}   reply to the n-th call
 #   $STUB_DIR/replies/<key>/{rc,stdout,stderr}       reply to every other call
-# with <key> one of: describe, save, load, operation, token, iam.
+# with <key> one of: describe, save, load, operation, token, iam, iam-get.
 # The number of calls per key is kept in $STUB_DIR/<key>.count.
 #
 # Cloud Storage is emulated on disk: gs://<bucket>/<object> lives at
@@ -109,6 +109,10 @@ case "${1:-} ${2:-} ${3:-}" in
   fi
   ;;
 "storage buckets create") mkdir -p "$(local_path "$4")" ;;
+"storage buckets get-iam-policy")
+  scripted iam-get && reply iam-get
+  printf '{"bindings": [], "etag": "CAE="}\n'
+  ;;
 "storage buckets add-iam-policy-binding") reply iam ;;
 *)
   printf 'stub gcloud: unsupported command: %s\n' "$*" >&2

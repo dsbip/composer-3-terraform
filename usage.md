@@ -275,11 +275,13 @@ composer_environments:
             - roles/iam.serviceAccountUser     -> Composer service agent on the env SA
 
       ── Software Configuration ───────────────────────────────────────────────────────────────────
-      (entire block optional; when omitted, GCP selects the latest stable Composer 3 image)
+      (entire block optional; when omitted, GCP selects its default image — see image_version)
 
           software_config:
               image_version:                 [Optional] Composer image version string. When omitted,
-                                                        GCP selects the latest stable Composer 3 version.
+                                                        GCP selects its default image, which may still
+                                                        be Composer 2 while Google rolls out the switch
+                                                        — pin e.g. "composer-3-airflow-2.10.5".
                                                         Must start with "composer-3" if provided. Check
                                                         available versions on the Composer versions
                                                         page or GET .../v1/projects/P/locations/R/
@@ -534,6 +536,9 @@ composer_environments:
 
               snapshot_prefix:               [Optional] Folder in the bucket; snapshots are stored in
                                                         {prefix}/{project}/{region}/{env-name}/.
+                                                        Change it (or snapshot_bucket) only while
+                                                        environments are running, or move the old
+                                                        folder first (startup refuses otherwise).
                                                         Default: "composer-hibernation"
 
               snapshot_retention_count:      [Optional] Snapshots kept per environment (>= 1).
@@ -541,11 +546,13 @@ composer_environments:
 
               pin_image_version:             [Optional] With no software_config.image_version, recreate
                                                         on the snapshot's Airflow version
-                                                        (composer-3-airflow-X.Y.Z).
+                                                        (composer-3-airflow-X.Y.Z). false = GCP's
+                                                        default image (checked before deleting).
                                                         Default: true
 
               delete_orphaned_bucket:        [Optional] Delete the auto-created environment bucket a
-                                                        deletion leaves behind (never storage.bucket).
+                                                        deletion leaves behind (never a bucket that any
+                                                        storage.bucket / snapshot_bucket in the YAML uses).
                                                         Default: true
 
               orphaned_bucket_retention_days:
@@ -673,7 +680,7 @@ Output structure per environment:
 │   ├── composer-3-settings/         # Provider-less settings resolver (shared with scripts)
 │   └── composer-3/
 │       ├── main.tf                  # google_composer_environment resource
-│       ├── variables.tf             # environment_key, config, global_config
+│       ├── variables.tf             # environment_key, config, global_config, fallback_image_version
 │       ├── locals.tf                # YAML merging + defaults
 │       ├── outputs.tf               # Module outputs
 │       ├── versions.tf              # Provider requirements

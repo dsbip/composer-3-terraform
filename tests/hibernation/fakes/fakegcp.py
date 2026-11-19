@@ -8,7 +8,7 @@ shapes and error texts (taken from the gcloud SDK source):
   composer environments describe | snapshots save | snapshots load
   composer operations describe
   storage cat | cp | ls [--recursive] | rm --recursive
-  storage buckets describe | create | add-iam-policy-binding
+  storage buckets describe | create | get-iam-policy | add-iam-policy-binding
 
 World layout:
   envs/<project>__<region>__<name>.json   describe JSON (+ "_"-prefixed internals)
@@ -348,6 +348,15 @@ def storage(args):
             meta = jload(bucket_meta_path(bucket))
             meta["create_flags"] = sorted(k for k in flags)
             jdump(bucket_meta_path(bucket), meta)
+        elif bsub == "get-iam-policy":
+            meta = jload(bucket_meta_path(bucket))
+            if meta is None:
+                fail(f"ERROR: (gcloud.storage.buckets.get-iam-policy) gs://{bucket} not found: 404.")
+            roles = {}
+            for b in meta["iam"]:
+                roles.setdefault(b["role"], []).append(b["member"])
+            out({"bindings": [{"role": r, "members": m} for r, m in sorted(roles.items())],
+                 "etag": "CAE=", "version": 1})
         elif bsub == "add-iam-policy-binding":
             meta = jload(bucket_meta_path(bucket))
             if meta is None:

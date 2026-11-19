@@ -4,8 +4,8 @@
 # Reads the same YAML the root module reads and resolves every environment
 # through modules/composer-3-settings — the module modules/composer-3 uses —
 # so the scripts see exactly the values Terraform will use. No providers, no
-# backend, no network: `terraform init -backend=false` + `terraform apply`
-# on a throw-away local state, then `terraform output -json environments`.
+# network: `terraform init` + `terraform apply` on a throw-away local state
+# (backend "local" below), then `terraform output -json environments`.
 # The scripts point the local backend at a temp file with
 #   terraform init -backend-config="path=<tmp>/resolver.tfstate"
 # and set TF_DATA_DIR to a temp dir, so nothing is written into the repo.

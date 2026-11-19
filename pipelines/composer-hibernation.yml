@@ -9,8 +9,9 @@
 #             targeted terraform apply from the SAME YAML → snapshot load
 #
 # Which environments take part is decided by the YAML (`hibernation.enabled`),
-# never by this file. Production environments are refused by the scripts and
-# by a Terraform precondition.
+# never by this file. Production environments are refused by the scripts
+# (and a Terraform precondition fails every create/update plan for a
+# production environment with hibernation enabled).
 #
 # Triggering (CI/CD → Schedules, on the protected default branch — or run
 # scripts/ci/create-hibernation-schedules.sh):
@@ -20,8 +21,10 @@
 # Optional schedule variable HIBERNATE_ENVIRONMENTS=composer-dev,composer-qa
 # limits a schedule to some environments (e.g. different hours per team).
 #
-# Ad-hoc: Build → Pipelines → Run pipeline with HIBERNATE_ACTION=shutdown or
-# startup (runs immediately), or without it to get manual buttons.
+# Ad-hoc: Build → Pipelines → Run pipeline on the default branch with
+# HIBERNATE_ACTION=shutdown or startup (runs immediately), or without it to
+# get manual buttons. HIBERNATE_ENVIRONMENTS set to an empty value is refused
+# (delete the variable instead to select every enabled environment).
 #
 # After the first run of each job, set the resource group to oldest_first so a
 # delayed shutdown can never be overtaken by the next startup:
@@ -45,7 +48,8 @@
     HIBERNATE_CONFIG_FILE: ${DEV_CONFIG_FILE}
     TF_BACKEND_BUCKET: ${DEV_BUCKET}
     TF_BACKEND_PREFIX: ${DEV_BUCKET_PREFIX}
-    HIBERNATE_WORK_DIR: ${CI_PROJECT_DIR}/.hibernation/${CI_JOB_NAME_SLUG}
+    # Unique per job: the scripts refuse a work dir holding an earlier run.
+    HIBERNATE_WORK_DIR: ${CI_PROJECT_DIR}/.hibernation/${CI_JOB_NAME_SLUG}-${CI_JOB_ID}
     # Leave room to upload logs/plans when the script itself runs too long.
     RUNNER_SCRIPT_TIMEOUT: 2h45m
     RUNNER_AFTER_SCRIPT_TIMEOUT: 10m
@@ -67,12 +71,16 @@
   # One lock for every job touching these environments (incl. dev-apply).
   resource_group: composer-hibernation-dev
 
+# Destructive jobs run only on the default branch (like dev-apply): a run on
+# another branch or a tag would apply that ref's unreviewed YAML/code to the
+# shared dev state. (An accident guard, not a security boundary: anyone who
+# can push a branch can change this file there — see docs/hibernation.md.)
 dev-composer-shutdown:
   extends: .composer_hibernation
   rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $HIBERNATE_ACTION == "shutdown"
-    - if: $CI_PIPELINE_SOURCE == "web" && $HIBERNATE_ACTION == "shutdown"
-    - if: $CI_PIPELINE_SOURCE == "web" && $HIBERNATE_ACTION == null
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $HIBERNATE_ACTION == "shutdown" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "web" && $HIBERNATE_ACTION == "shutdown" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "web" && $HIBERNATE_ACTION == null && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: manual
       allow_failure: true
   script:
@@ -81,9 +89,9 @@ dev-composer-shutdown:
 dev-composer-startup:
   extends: .composer_hibernation
   rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $HIBERNATE_ACTION == "startup"
-    - if: $CI_PIPELINE_SOURCE == "web" && $HIBERNATE_ACTION == "startup"
-    - if: $CI_PIPELINE_SOURCE == "web" && $HIBERNATE_ACTION == null
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $HIBERNATE_ACTION == "startup" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "web" && $HIBERNATE_ACTION == "startup" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "web" && $HIBERNATE_ACTION == null && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: manual
       allow_failure: true
   script:
@@ -91,6 +99,9 @@ dev-composer-startup:
 
 # Read-only rehearsal (no snapshot, no apply, no state-file writes): resolves
 # the YAML, inspects the environments and runs the guarded terraform plans.
+# Allowed on any branch (it changes nothing). The startup half only plans a
+# recreate for environments that are currently absent, so run it while they
+# are hibernated to rehearse that plan.
 dev-composer-hibernation-dry-run:
   # Plans only — deliberately not in the exclusive resource group.
   extends: .composer_hibernation_base

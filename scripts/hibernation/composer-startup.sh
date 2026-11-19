@@ -41,8 +41,14 @@ Startup-only options:
                            resources in the Terraform state yet (first ever
                            deployment). Without it such environments fail,
                            which protects against a misconfigured backend.
-      --skip-load          Recreate environments but do not load snapshots
-                           (they are marked ACTIVE with empty Airflow state).
+      --skip-load          Do not load snapshots: recreated environments start
+                           empty, running ones are kept as they are; all are
+                           marked ACTIVE (the next shutdown's snapshot then
+                           becomes the restore point).
+      --force-load         Load the snapshot even into an environment that has
+                           been running for more than HIBERNATE_FRESH_ENV_HOURS
+                           while the state file says it is hibernated
+                           (overwrites its Airflow database).
 EOF
   echo
   common_usage_options
@@ -55,6 +61,7 @@ FALLBACK_JSON='{}'
 preflight() {
   local key="$1" state status has_snapshot action rc snapshot image pin
   info "[${key}] preflight"
+  rm -f "${ACTION_DIR}/${key}" # only this run's decision drives it
   check_environment_eligible "${key}" || {
     result_set "${key}" failed "not eligible for hibernation (see log)"
     return 0
@@ -65,6 +72,8 @@ preflight() {
     result_set "${key}" failed "could not read the hibernation state file"
     return 0
   fi
+  local manifest_found=true
+  ((rc == 0)) || manifest_found=false
   status="$(manifest_get "${key}" .status)"
   snapshot="$(manifest_get "${key}" .latest_snapshot.path)"
   has_snapshot=false
@@ -74,7 +83,17 @@ preflight() {
     result_set "${key}" failed "could not determine the environment state"
     return 0
   }
-  action="$(decide_startup_action "${state}" "${status:-NONE}" "${has_snapshot}")"
+  # For a running environment: is it the one that was snapshotted, how long
+  # has it been running, and did an earlier load into it already finish?
+  local recreated=false fresh=true done=false
+  if [[ "${state}" == RUNNING ]]; then
+    env_recreated_since_snapshot "${key}" && recreated=true
+    env_is_fresh "${key}" || fresh=false
+    [[ "${status}" == RESTORING && "$(restore_attempt_state "${key}")" == SUCCEEDED ]] && done=true
+  fi
+  # --skip-load / --force-load settle the "running for long" ambiguity.
+  [[ "${OPT_SKIP_LOAD}" == true || "${OPT_FORCE_LOAD}" == true ]] && fresh=true
+  action="$(decide_startup_action "${state}" "${status:-NONE}" "${has_snapshot}" "${recreated}" "${fresh}" "${done}")"
   if [[ "${OPT_SKIP_LOAD}" == true ]]; then
     case "${action}" in
     create_and_load) action=create_fresh ;;
@@ -90,8 +109,23 @@ preflight() {
       result_set "${key}" failed "no resources of $(tf_module_prefix "${key}") in the Terraform state — wrong backend? (use --allow-initial-create for a first deployment)"
       return 0
     fi
+    # Deployed before, Composer resource gone (= hibernated) but no state
+    # file: the restore point is elsewhere — most likely
+    # hibernation.snapshot_bucket/snapshot_prefix changed while hibernated.
+    if [[ "${action}" == create_fresh && "${manifest_found}" != true && "${OPT_ALLOW_INITIAL_CREATE}" != true ]] &&
+      tf_module_in_state "${key}" && ! tf_resource_in_state "${key}"; then
+      result_set "${key}" failed "no hibernation state file at $(setting "${key}" .hibernation.state_object) although $(tf_module_prefix "${key}") is deployed and its Composer environment is gone — was hibernation.snapshot_bucket/snapshot_prefix changed while hibernated? Move the old folder (state file + snapshots) there, or re-run with --allow-initial-create to create an empty environment"
+      return 0
+    fi
+    if [[ "${action}" == replace_* ]] && ! check_state_identity "${key}"; then
+      result_set "${key}" failed "the Terraform state and the YAML disagree on which environment this is (see log) — not replacing it"
+      return 0
+    fi
     [[ "${action}" == create_fresh && -z "${snapshot}" ]] &&
       warn "[${key}] no snapshot available: a fresh, empty environment will be created"
+    if [[ "${action}" == create_and_load && "${status}" != HIBERNATED && "${status}" != RESTORING ]]; then
+      warn "[${key}] the environment disappeared outside the hibernation cycle (state file: ${status:-NONE}); it is recreated from the last snapshot, taken $(manifest_get "${key}" .latest_snapshot.saved_at)"
+    fi
     # Recreate on the snapshot's Airflow version when the YAML does not pin one.
     image="$(manifest_get "${key}" .latest_snapshot.image_version)"
     if [[ -z "$(setting "${key}" .image_version)" && "$(setting "${key}" .hibernation.pin_image_version)" == true && -n "${image}" && "${action}" == *_and_load ]]; then
@@ -109,6 +143,23 @@ preflight() {
       manifest_transition "${key}" ACTIVE "environment running; no restore needed (${status:-NONE})" || true
     fi
     result_set "${key}" ok "environment is running; no restore needed"
+    return 0
+    ;;
+  mark_restored)
+    if [[ "${OPT_DRY_RUN}" != true ]]; then
+      manifest_update "${key}" '.last_restore = {snapshot: $s, at: $t, image_version: $i, operation: $op}' \
+        --arg s "${snapshot}" --arg t "$(_ts)" --arg i "$(describe_get "${key}" .config.softwareConfig.imageVersion)" \
+        --arg op "$(manifest_get "${key}" .restore_attempt.operation)"
+      manifest_transition "${key}" ACTIVE "snapshot load had already completed: ${snapshot}" || {
+        result_set "${key}" failed "could not update the state file"
+        return 0
+      }
+    fi
+    result_set "${key}" ok "the earlier load of ${snapshot} had completed; marked ACTIVE (not loaded again)"
+    return 0
+    ;;
+  refuse_stale)
+    result_set "${key}" failed "environment has been running since $(describe_get "${key}" .createTime) (over ${HIBERNATE_FRESH_ENV_HOURS}h) although the state file says ${status}; loading ${snapshot} would overwrite its Airflow database — re-run with --skip-load to keep it as it is, or with --force-load to replace it with the snapshot"
     return 0
     ;;
   noop)
@@ -165,7 +216,9 @@ restore_env() {
   local snap_image
   snap_image="$(manifest_get "${key}" .latest_snapshot.image_version)"
   if [[ -n "${snap_image}" ]] && ! airflow_version_satisfies "$(airflow_version_of "${image}")" "$(airflow_version_of "${snap_image}")"; then
-    result_set "${key}" failed "environment runs ${image:-an unknown image} but the snapshot was taken on ${snap_image}; snapshots only load into the same or a later Airflow version — set software_config.image_version accordingly and re-run startup"
+    # A re-run alone does not help: startup does not touch a running
+    # environment's image. Upgrade it (deploy) or delete it first.
+    result_set "${key}" failed "environment runs ${image:-an unknown image} but the snapshot was taken on ${snap_image}; snapshots only load into the same or a later Airflow version — set software_config.image_version to a compatible version, apply it with the normal deploy (in-place upgrade) or delete the environment, then re-run startup"
     return 0
   fi
 
@@ -185,14 +238,24 @@ restore_env() {
     }
   fi
   opts="$(setting "${key}" .hibernation.load_options)"
-  if ! composer_snapshot_load "${name}" "${region}" "${project}" "${snapshot}" "${opts}"; then
-    result_set "${key}" failed "snapshot load failed (state stays RESTORING; re-run startup to retry)"
+  # A load an earlier run started (and gave up waiting for) may still be
+  # running: wait for it instead of starting a second one.
+  local loaded=false attempt_op
+  if [[ "$(restore_attempt_state "${key}")" == RUNNING ]]; then
+    attempt_op="$(manifest_get "${key}" .restore_attempt.operation)"
+    info "[${key}] the snapshot load started earlier (${attempt_op##*/}) is still running; waiting for it"
+    wait_for_operation "${attempt_op}" "${region}" "${project}" "snapshot load into ${name}" >/dev/null && loaded=true
+    [[ "${loaded}" == true ]] || wait_for_composer_state "${name}" "${region}" "${project}" RUNNING,ERROR >/dev/null || true
+  fi
+  if [[ "${loaded}" != true ]] &&
+    ! composer_snapshot_load "${name}" "${region}" "${project}" "${snapshot}" "${opts}" record_restore_attempt "${key}" "${snapshot}"; then
+    result_set "${key}" failed "snapshot load failed (state stays RESTORING; re-run startup to retry — a load that still finishes server-side is recognised)"
     return 0
   fi
   manifest_update "${key}" '.last_restore = {snapshot: $s, at: $t, image_version: $i, load_options: $o}' \
     --arg s "${snapshot}" --arg t "$(_ts)" --arg i "${image}" --argjson o "${opts}"
   if ! manifest_transition "${key}" ACTIVE "snapshot loaded: ${snapshot}"; then
-    result_set "${key}" failed "snapshot loaded but the state file could not be updated (a re-run would load it again)"
+    result_set "${key}" failed "snapshot loaded but the state file could not be updated; re-run startup (it recognises the completed load and only marks the environment ACTIVE)"
     return 0
   fi
   result_set "${key}" ok "restored from ${snapshot} (${image})"
@@ -204,7 +267,6 @@ main() {
   require_cmds terraform gcloud jq realpath comm awk
   init_work_dir startup
   ACTION_DIR="${OPT_WORK_DIR}/actions"
-  mkdir -p "${ACTION_DIR}"
   [[ "${OPT_DRY_RUN}" == true ]] && warn "DRY RUN — nothing will be changed"
 
   resolve_config
@@ -275,7 +337,11 @@ main() {
     else
       for key in "${tf_keys[@]}"; do
         case "$(cat "${ACTION_DIR}/${key}")" in
-        replace_*) plan_must_contain "${OPT_WORK_DIR}/plans/recreate.json" "$(tf_address "${key}")" "delete,create|create,delete" || tf_ok=false ;;
+        replace_*)
+          plan_must_contain "${OPT_WORK_DIR}/plans/recreate.json" "$(tf_address "${key}")" "delete,create|create,delete" || tf_ok=false
+          plan_deletes_identity "${OPT_WORK_DIR}/plans/recreate.json" "$(tf_address "${key}")" "$(settings_identity "${key}")" ||
+            tf_ok=false
+          ;;
         *) plan_must_contain "${OPT_WORK_DIR}/plans/recreate.json" "$(tf_address "${key}")" create || tf_ok=false ;;
         esac
       done

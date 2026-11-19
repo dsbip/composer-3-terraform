@@ -540,3 +540,278 @@ EOF
   [[ "$output" == *"nothing to do"* ]]
   ! gcloud_calls | grep -q composer
 }
+
+# ── Review findings: each scenario reproduced the original problem ──────────
+
+manual_deploy() {
+  # The normal (non-targeted) deploy pipeline, e.g. dev-apply at night.
+  terraform -chdir="${TF_ROOT}" plan -input=false -no-color -var config_file=configs/hibernation.yaml -out="${W}/manual.tfplan" >/dev/null
+  terraform -chdir="${TF_ROOT}" apply "${W}/manual.tfplan" >/dev/null
+}
+
+long_ago() { date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ; }
+
+@test "a shutdown of an environment re-created empty while hibernated keeps the good restore point" {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  local good
+  good="$(manifest_field composer-dev .latest_snapshot.path)"
+  manual_deploy
+  [ "$(env_field composer-dev ._db)" = "" ]
+  # No startup in between (e.g. a manual shutdown that same night).
+  shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"re-created"*"never restored; keeping ${good} as the restore point"* ]]
+  [ "$(env_state composer-dev)" = NOT_FOUND ]
+  [ "$(manifest_field composer-dev .latest_snapshot.path)" = "${good}" ]
+  [ "$(manifest_field composer-dev '.snapshots[0].restore_incomplete')" = true ]
+  startup_run --env composer-dev
+  [ "$status" -eq 0 ]
+  [ "$(env_field composer-dev ._db)" = airflow-db-of-composer-dev ]
+}
+
+@test "an environment re-created long ago (outside the cycle) is treated as holding real work by shutdown" {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  local good
+  good="$(manifest_field composer-dev .latest_snapshot.path)"
+  manual_deploy
+  set_env_field composer-dev "._db = \"weeks-of-work\" | .createTime = \"$(long_ago)\""
+  shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"treating it as holding real work"* ]]
+  [ "$(manifest_field composer-dev .latest_snapshot.path)" != "${good}" ]
+  startup_run --env composer-dev
+  [ "$status" -eq 0 ]
+  [ "$(env_field composer-dev ._db)" = weeks-of-work ]
+}
+
+@test "startup refuses to load over an environment running long outside the cycle; --force-load overrides" {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  manual_deploy
+  set_env_field composer-dev "._db = \"weeks-of-work\" | .createTime = \"$(long_ago)\""
+  startup_run --env composer-dev
+  show_output
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"would overwrite its Airflow database"*"--skip-load"*"--force-load"* ]]
+  [ "$(env_field composer-dev ._db)" = weeks-of-work ]
+  ! gcloud_calls | grep -q '"snapshots", "load", "composer-dev"'
+  [ "$(manifest_field composer-dev .status)" = HIBERNATED ]
+
+  startup_run --env composer-dev --force-load
+  show_output
+  [ "$status" -eq 0 ]
+  [ "$(env_field composer-dev ._db)" = airflow-db-of-composer-dev ]
+}
+
+@test "startup --skip-load keeps an environment running long outside the cycle as it is" {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  manual_deploy
+  set_env_field composer-dev "._db = \"weeks-of-work\" | .createTime = \"$(long_ago)\""
+  startup_run --env composer-dev --skip-load
+  show_output
+  [ "$status" -eq 0 ]
+  [ "$(manifest_field composer-dev .status)" = ACTIVE ]
+  [ "$(env_field composer-dev ._db)" = weeks-of-work ]
+}
+
+@test "SNAPSHOT_SAVED left by an interrupted shutdown, then a deploy: startup still loads (uuid changed)" {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  set_manifest_field composer-dev '.status = "SNAPSHOT_SAVED"'
+  manual_deploy
+  startup_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"→ load"* ]]
+  [ "$(env_field composer-dev ._db)" = airflow-db-of-composer-dev ]
+  [ "$(manifest_field composer-dev .status)" = ACTIVE ]
+}
+
+@test "a load that completed although the state file stayed RESTORING is recognised by startup and shutdown" {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  startup_run --env composer-dev
+  [ "$status" -eq 0 ]
+  [ -n "$(manifest_field composer-dev .restore_attempt.operation)" ]
+  # The final ACTIVE write "failed"; users then work all day.
+  set_manifest_field composer-dev '.status = "RESTORING"'
+  set_env_field composer-dev '._db = "work-of-today"'
+  startup_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"→ mark_restored"* ]]
+  [ "$(env_field composer-dev ._db)" = work-of-today ]
+  [ "$(gcloud_calls | grep -c '"snapshots", "load", "composer-dev"')" = 1 ]
+  [ "$(manifest_field composer-dev .status)" = ACTIVE ]
+
+  # Same situation at the evening shutdown: today's snapshot is the restore point.
+  set_manifest_field composer-dev '.status = "RESTORING"'
+  shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  local snap
+  snap="$(manifest_field composer-dev .latest_snapshot.path)"
+  [ "$(cat "$(gcs_path "${snap}")/airflow-database.sql.gz")" = work-of-today ]
+}
+
+@test "a work dir holding an earlier run's files is refused (a stale marker must never delete)" {
+  run "${SHUTDOWN}" --work-dir "${W}/reused" --dry-run
+  [ "$status" -eq 0 ]
+  add_op_fault 'snapshots save composer-dev' 'snapshot failed'
+  run "${SHUTDOWN}" --work-dir "${W}/reused"
+  show_output
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"already holds the files of an earlier run"* ]]
+  [ "$(env_state composer-dev)" = RUNNING ]
+  [ "$(env_state composer-test)" = RUNNING ]
+}
+
+@test "an unapplied rename onto an existing environment: nothing is snapshotted or deleted" {
+  python3 "${HIB_TEST_DIR}/fakes/fakegcp.py" seed-env "project=${PROJECT}" "region=${REGION}" name=composer-qa db=qa-data
+  yaml_edit 'c["environments"]["composer-dev"]["environment_name"] = "composer-qa"'
+  shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"is ${PROJECT}/${REGION}/composer-dev in the Terraform state but the YAML resolves to ${PROJECT}/${REGION}/composer-qa"* ]]
+  [ "$(env_state composer-dev)" = RUNNING ]
+  [ "$(env_state composer-qa)" = RUNNING ]
+  ! gcloud_calls | grep -q '"snapshots", "save"'
+  ! gcloud_calls | grep -q add-iam-policy-binding
+}
+
+@test "two keys resolving to the same environment are refused" {
+  yaml_edit 'c["environments"]["composer-test"]["environment_name"] = "composer-dev"'
+  shutdown_run
+  show_output
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"is also defined by: composer-test"* ]]
+  [ "$(env_state composer-dev)" = RUNNING ]
+  [ "$(env_state composer-test)" = RUNNING ]
+  ! gcloud_calls | grep -q '"snapshots", "save"'
+}
+
+@test "plan guard refuses a destroy that would remove another environment than the one snapshotted" {
+  export FAKE_TF_SHOW_JQ='if has("resource_changes") then .resource_changes |= map(if .address == "module.composer[\"composer-dev\"].google_composer_environment.this" then .change.before.name = "composer-qa" else . end) else . end'
+  shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"would remove ${PROJECT}/${REGION}/composer-qa, expected ${PROJECT}/${REGION}/composer-dev"* ]]
+  [ "$(env_state composer-dev)" = RUNNING ]
+  [ "$(tf_apply_count)" = 0 ]
+}
+
+@test "startup refuses to create an empty environment when the state file moved (snapshot_prefix changed while hibernated)" {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  local applies
+  applies="$(tf_apply_count)"
+  yaml_edit 'c["hibernation"]["snapshot_prefix"] = "moved"'
+  startup_run --env composer-dev
+  show_output
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"snapshot_bucket/snapshot_prefix changed while hibernated"* ]]
+  [ "$(env_state composer-dev)" = NOT_FOUND ]
+  [ "$(tf_apply_count)" = "${applies}" ]
+}
+
+@test "a recorded orphan bucket that became the environment's storage.bucket is never deleted" {
+  local b1
+  b1="$(env_field composer-dev .storageConfig.bucket)"
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  [ "$(manifest_field composer-dev '.orphaned_buckets[0].bucket')" = "${b1}" ]
+  yaml_edit "c['environments']['composer-dev']['storage'] = {'bucket': '${b1}'}"
+  startup_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  [ "$(env_field composer-dev .storageConfig.bucket)" = "${b1}" ]
+  set_manifest_field composer-dev '.orphaned_buckets[0].orphaned_epoch -= 8*86400'
+  shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  bucket_exists "${b1}"
+  [ "$(manifest_field composer-dev '.orphaned_buckets | length')" = 0 ]
+  [[ "$output" == *"no longer treated as orphaned"* ]]
+}
+
+@test "the bucket of an interrupted shutdown is still scheduled for deletion by the recovery run" {
+  local b1
+  b1="$(env_field composer-dev .storageConfig.bucket)"
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  set_manifest_field composer-dev '.status = "SNAPSHOT_SAVED" | .orphaned_buckets = []'
+  shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"marked HIBERNATED"* ]]
+  [ "$(manifest_field composer-dev '.orphaned_buckets[0].bucket')" = "${b1}" ]
+}
+
+@test "a snapshot folder deleted outside the scripts is dropped from the list; the bucket grant is not repeated" {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  startup_run --env composer-dev
+  [ "$status" -eq 0 ]
+  local old
+  old="$(manifest_field composer-dev .latest_snapshot.path)"
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  startup_run --env composer-dev
+  [ "$status" -eq 0 ]
+  rm -rf "$(gcs_path "${old}")"
+  shutdown_run --env composer-dev # retention 2 prunes the (vanished) oldest one
+  show_output
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"could not delete"* ]]
+  [[ "$output" == *"was already gone"* ]]
+  [ "$(manifest_field composer-dev '.snapshots | length')" = 2 ]
+  [ "$(gcloud_calls | grep -c add-iam-policy-binding)" = 1 ]
+}
+
+@test "an API outage while polling a snapshot is ridden out within the grace period" {
+  add_fault 'operations describe' 1 'ERROR: (gcloud.composer.operations.describe) UNAVAILABLE: The service is currently unavailable.' 4
+  HIBERNATE_POLL_FAILURE_GRACE_SECONDS=120 shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"could not poll operation"*"trying again"* ]]
+  [ "$(env_state composer-dev)" = NOT_FOUND ]
+}
+
+@test "a snapshot save abandoned while polling is tracked, then handed to retention" {
+  export FAKE_OP_POLLS=0
+  add_fault 'operations describe' 1 'ERROR: (gcloud.composer.operations.describe) UNAVAILABLE: The service is currently unavailable.' 3
+  shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 1 ]
+  [ "$(env_state composer-dev)" = RUNNING ]
+  [ "$(manifest_field composer-dev '.pending_saves | length')" = 1 ]
+  shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  [ "$(manifest_field composer-dev '.pending_saves | length')" = 0 ]
+  [ "$(manifest_field composer-dev '[.snapshots[] | select(.untracked == true)] | length')" = 1 ]
+}
+
+@test "pin_image_version false: refuses to delete when GCP's default image could not load the snapshot" {
+  yaml_edit 'c["environments"]["composer-dev"]["hibernation"] = {"pin_image_version": False}'
+  jq 'map(.isDefault = (.imageVersionId == "composer-3-airflow-2.9.3-build.30"))' \
+    "${FAKE_GCP_DIR}/image-versions.json" >"${W}/iv.json" && mv "${W}/iv.json" "${FAKE_GCP_DIR}/image-versions.json"
+  shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"GCP's default image composer-3-airflow-2.9.3-build.30, which cannot load a snapshot"* ]]
+  [ "$(env_state composer-dev)" = RUNNING ]
+}
+
+@test "HIBERNATE_ENVIRONMENTS naming no environment touches nothing" {
+  HIBERNATE_ENVIRONMENTS=" , " shutdown_run
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"names no environment"* ]]
+  [ "$(env_state composer-dev)" = RUNNING ]
+  [ "$(env_state composer-test)" = RUNNING ]
+}

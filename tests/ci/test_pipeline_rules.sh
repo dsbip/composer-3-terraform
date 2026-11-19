@@ -31,27 +31,33 @@ git update-ref refs/remotes/origin/main HEAD
 git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
 git remote add origin https://gitlab.example.com/group/composer-3-terraform.git
 
-# jobs SOURCE ACTION -> sorted "job:when" lines
+# jobs SOURCE ACTION [REF] -> sorted "job:when" lines
+#   REF: a branch name (default main), or tag:<name> for a tag pipeline
 jobs() {
-  local src="$1" act="$2"
-  local args=(--variable "CI_PIPELINE_SOURCE=${src}" --variable CI_DEFAULT_BRANCH=main --variable CI_COMMIT_BRANCH=main)
+  local src="$1" act="$2" ref="${3:-main}"
+  local args=(--variable "CI_PIPELINE_SOURCE=${src}" --variable CI_DEFAULT_BRANCH=main)
+  if [[ "${ref}" == tag:* ]]; then
+    args+=(--variable CI_COMMIT_BRANCH= --variable "CI_COMMIT_TAG=${ref#tag:}")
+  else
+    args+=(--variable "CI_COMMIT_BRANCH=${ref}" --variable CI_COMMIT_TAG=)
+  fi
   [[ -n "${act}" ]] && args+=(--variable "HIBERNATE_ACTION=${act}")
   if [[ "${src}" == merge_request_event ]]; then
     args+=(--variable CI_MERGE_REQUEST_IID=7 --variable CI_COMMIT_BRANCH=)
   fi
-  GCL_IGNORE_PREDEFINED_VARS=CI_PIPELINE_SOURCE,CI_DEFAULT_BRANCH,CI_COMMIT_BRANCH \
+  GCL_IGNORE_PREDEFINED_VARS=CI_PIPELINE_SOURCE,CI_DEFAULT_BRANCH,CI_COMMIT_BRANCH,CI_COMMIT_TAG \
     "${gcl}" --list-json "${args[@]}" 2>/dev/null |
     jq -r '.[] | select(.when != "never") | "\(.name):\(.when)"' | sort | paste -sd' ' -
 }
 
 fail=0
 expect() {
-  local src="$1" act="$2" want="$3" got
-  got="$(jobs "${src}" "${act}")"
+  local src="$1" act="$2" want="$3" ref="${4:-main}" got
+  got="$(jobs "${src}" "${act}" "${ref}")"
   if [[ "${got}" == "${want}" ]]; then
-    echo "ok   source=${src} action=${act:-<none>}: ${got}"
+    echo "ok   source=${src} action=${act:-<none>} ref=${ref}: ${got}"
   else
-    echo "FAIL source=${src} action=${act:-<none>}"
+    echo "FAIL source=${src} action=${act:-<none>} ref=${ref}"
     echo "     want: ${want}"
     echo "     got:  ${got}"
     fail=1
@@ -76,5 +82,17 @@ expect web "" "dev-apply:manual dev-composer-hibernation-dry-run:manual dev-comp
 expect push "" "dev-apply:manual dev-composer-hibernation-dry-run:manual dev-plan:on_success ${checks}"
 # Merge request: checks + plan only.
 expect merge_request_event "" "dev-plan:on_success ${checks}"
+
+# Other branches and tags never run the destructive hibernation jobs (their
+# unreviewed YAML/code would hit the shared dev state); the read-only
+# dry-run stays available.
+expect schedule shutdown "" feature/x
+expect schedule startup "" feature/x
+expect web shutdown "" feature/x
+expect web startup "" feature/x
+expect web dry-run "dev-composer-hibernation-dry-run:on_success" feature/x
+expect web "" "dev-composer-hibernation-dry-run:manual ${checks}" feature/x
+expect schedule shutdown "" tag:v1.0.0
+expect web startup "" tag:v1.0.0
 
 exit "${fail}"

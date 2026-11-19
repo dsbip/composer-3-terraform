@@ -63,10 +63,10 @@ and `configs/multi-environment.yaml` show it in context.
 | `snapshot_bucket` | `<project_id>-composer-snapshots` | Bucket for snapshots and the state file. Created by the scripts if missing (uniform bucket-level access, public access prevention). One bucket can serve many environments. Must differ from `storage.bucket`. |
 | `snapshot_bucket_location` | environment region | Location used when the bucket is created. |
 | `create_snapshot_bucket` | `true` | `false` = the bucket must already exist. |
-| `snapshot_prefix` | `composer-hibernation` | Folder inside the bucket. Snapshots live in `<prefix>/<project>/<region>/<environment-name>/`. |
+| `snapshot_prefix` | `composer-hibernation` | Folder inside the bucket. Snapshots live in `<prefix>/<project>/<region>/<environment-name>/`. See [moving the snapshot location](#moving-the-snapshot-location) before changing this or `snapshot_bucket`. |
 | `snapshot_retention_count` | `7` | Snapshots kept per environment. The current restore point is never pruned. |
-| `pin_image_version` | `true` | When the YAML has no `software_config.image_version`, recreate on the Airflow version the snapshot was taken on (`composer-3-airflow-X.Y.Z`, newest build). Snapshots can only be loaded into the same or a later Airflow version. |
-| `delete_orphaned_bucket` | `true` | Deleting an environment leaves its auto-created bucket behind and the restore creates a new one. When `true`, the old bucket is deleted after the grace period below. Buckets set with `storage.bucket` are never deleted. |
+| `pin_image_version` | `true` | When the YAML has no `software_config.image_version`, recreate on the Airflow version the snapshot was taken on (`composer-3-airflow-X.Y.Z`, newest build). Snapshots can only be loaded into the same or a later Airflow version. With `false` (and no YAML version) the restore uses GCP's default image, so the shutdown checks that the current default is a Composer 3 image able to load the snapshot, and refuses to delete otherwise. |
+| `delete_orphaned_bucket` | `true` | Deleting an environment leaves its auto-created bucket behind and the restore creates a new one. When `true`, the old bucket is deleted after the grace period below. Only buckets named like this environment's auto-created bucket are recorded, and right before deleting one it is checked again against every `storage.bucket` and snapshot bucket in the YAML: buckets in use are never deleted. |
 | `orphaned_bucket_retention_days` | `7` | Grace period before an orphaned bucket (and the task logs in it) is deleted. `0` = right after the shutdown. |
 | `load_options.skip_pypi_packages_installation` | `true` | Terraform already installed the YAML's PyPI packages. |
 | `load_options.skip_environment_variables_setting` | `true` | Terraform already set the YAML's environment variables. |
@@ -77,8 +77,11 @@ The three `skip_*: true` defaults keep the YAML the single source of truth (no
 Terraform drift after a restore) and avoid the slow PyPI re-installation.
 
 Invalid values (wrong types, unknown keys, retention < 1, bad bucket names,
-hibernation on a production environment, …) fail `terraform plan` through a
-precondition on the Composer resource and stop the scripts before they act.
+hibernation on a production environment, …) stop the scripts before they act,
+and fail every create/update `terraform plan` (normal deploys and startup)
+through a precondition on the Composer resource. Terraform does not evaluate
+preconditions in destroy plans, so for the shutdown the scripts' own check —
+fed by the same settings module — is the guard.
 
 ### Production detection
 
@@ -116,6 +119,15 @@ environments for 12–18 months after release: a version that is fine for a
 running environment can become impossible to *re-create* — the shutdown script
 checks this before deleting anything (see below).
 
+### Moving the snapshot location
+
+`snapshot_bucket` and `snapshot_prefix` decide where the state file lives.
+Change them only while the environments are `ACTIVE` (running), or first move
+the whole folder `<old location>/` (state file and snapshots) to the new
+location. A startup that finds a deployed, hibernated environment without a
+state file refuses to create it empty and names the location it expected
+(`--allow-initial-create` overrides this).
+
 ---
 
 ## 2. What protects your environments
@@ -123,35 +135,47 @@ checks this before deleting anything (see below).
 Nothing is deleted unless **all** of these hold:
 
 1. `hibernation.enabled: true` and the configuration is valid.
-2. The environment is not production (labels/name — and a Terraform precondition).
+2. The environment is not production (labels/name, see above).
 3. The environment is `RUNNING` (transitional states are waited out; `ERROR`
    environments are refused unless `--force-delete-without-snapshot`).
-4. Its `google_composer_environment` is in **this** Terraform state (protects
-   against a wrong backend/state).
-5. It can be restored tomorrow: the restore image version (YAML's, or the
-   pinned current Airflow version) can still be used to **create**
-   environments (checked against the Composer `imageVersions` API, fail-closed)
-   and is not older than the running Airflow version.
+4. Its `google_composer_environment` is in **this** Terraform state and is
+   **this** environment: the project/region/name in the state equal what the
+   YAML resolves to. This catches a wrong backend, an unapplied rename or
+   project move onto an existing environment, and a copy-pasted
+   `environment_name` (two YAML keys resolving to one environment are refused).
+5. It can be restored tomorrow: the restore image version (YAML's, the pinned
+   current Airflow version, or — with `pin_image_version: false` — GCP's
+   default image) can still be used to **create** environments (checked
+   against the Composer `imageVersions` API, fail-closed) and is not older
+   than the running Airflow version.
 6. The snapshot operation finished without error, returned its `snapshotPath`,
    and the snapshot folder contains the Airflow database dump (`*.sql.gz`).
 7. The snapshot is recorded in the state file.
 8. The Terraform destroy plan contains **only** deletions of the selected
-   Composer environments, and each of them (a mistyped target silently plans
-   nothing in Terraform).
+   Composer environments, each of them (a mistyped target silently plans
+   nothing in Terraform), and each deletion removes the expected
+   project/region/name.
+9. Only what this run decided counts: a `--work-dir` that still holds an
+   earlier run's files is refused.
 
 On startup the Terraform plan may only create/update resources inside the
 selected environments' module instances (`module.composer["<key>"]`); a
 replacement is accepted only for an environment that is in `ERROR` during a
-restore. The whole module instance is targeted on purpose: a resource-level
+restore (and only if it is the expected project/region/name). The whole module
+instance is targeted on purpose: a resource-level
 `-target` also pulls in the same-named dependencies of every *other*
 environment, so a pending change elsewhere — even in production — would leak
 into the plan (verified with real Terraform; see
 `tests/hibernation/fixtures/plans/create-resource-target-leak.json`).
-Snapshots are loaded only into the same or a later Airflow version.
+Snapshots are loaded only into the same or a later Airflow version, and never
+over an environment that has been running for longer than
+`HIBERNATE_FRESH_ENV_HOURS` (default 96 h) while the state file says it is
+hibernated — that one may hold real work (see the state file below).
 
 GitLab adds: one `resource_group` shared by shutdown, startup and `dev-apply`
-(never two at once), `interruptible: false`, and `auto_cancel: none` for
-scheduled/manual pipelines so a merge cannot cancel a running shutdown.
+(never two at once), `interruptible: false`, `auto_cancel: none` for
+scheduled/manual pipelines so a merge cannot cancel a running shutdown, and
+shutdown/startup run only on the default branch.
 
 ---
 
@@ -159,16 +183,30 @@ scheduled/manual pipelines so a merge cannot cancel a running shutdown.
 
 Each environment has `<snapshot_location>/hibernation-state.json`:
 
-| Status | Meaning | Next startup |
-|---|---|---|
-| `SNAPSHOT_SAVED` | Snapshot taken; deletion not (yet) confirmed. | Restores it if the environment is gone, otherwise nothing. |
-| `HIBERNATED` | Environment deleted; `latest_snapshot` is the restore point. | Recreate + load. |
-| `RESTORING` | A startup is in progress or was interrupted. | Resumes: creates if missing, replaces if `ERROR`, loads. |
-| `ACTIVE` | Running with the snapshot restored. | Nothing. |
+| Status | Meaning | Next startup, environment absent | Next startup, environment running |
+|---|---|---|---|
+| `NONE` (no file) | Never hibernated. | Creates it empty — unless the module is deployed and only the Composer resource is gone (hibernated, but the state file is elsewhere: refused, see [moving the snapshot location](#moving-the-snapshot-location)) or was never deployed (`--allow-initial-create`). | Nothing. |
+| `SNAPSHOT_SAVED` | Snapshot taken; deletion not (yet) confirmed. | Recreate + load. | Same environment as snapshotted (uuid): it was never deleted → `ACTIVE`, nothing loaded. Re-created since: like `HIBERNATED`. |
+| `HIBERNATED` | Environment deleted; `latest_snapshot` is the restore point. | Recreate + load. | Re-created outside the cycle (e.g. `dev-apply` at night): load into it if it is younger than `HIBERNATE_FRESH_ENV_HOURS`; otherwise refused — `--skip-load` keeps it as it is, `--force-load` loads. |
+| `RESTORING` | A startup is in progress or was interrupted. | Recreate + load (`ERROR`: replace + load). | Load — unless the recorded load into this environment already finished (then only `ACTIVE` is written); same age rule as above. |
+| `ACTIVE` | Running with the snapshot restored (or created empty). | Deleted outside the cycle: recreated from the last snapshot (the log names its date). | Nothing. |
 
-It also records every snapshot (path, time, image/Airflow version, service
-account, environment bucket), orphaned buckets awaiting deletion, the last
-restore, and a bounded history with the GitLab pipeline/job of each change.
+A shutdown normally makes its new snapshot the restore point. It keeps the old
+one (and stores the new snapshot as secondary, `restore_incomplete: true`) when
+the environment never received it: a restore that did not complete
+(`RESTORING`), or an environment re-created while `HIBERNATED` /
+`SNAPSHOT_SAVED`. An environment running for longer than
+`HIBERNATE_FRESH_ENV_HOURS` is assumed to hold real work, and its snapshot
+becomes the restore point (the old one stays until retention prunes it).
+`--skip-load` deliberately starts empty, so the next shutdown's snapshot of
+that empty environment becomes the restore point.
+
+The file also records every snapshot (path, time, image/Airflow version,
+service account, environment bucket, environment uuid and creation time),
+the last load operation (`restore_attempt`), snapshot saves abandoned while
+still running (`pending_saves`, later handed to retention), orphaned buckets
+awaiting deletion, the last restore, and a bounded history with the GitLab
+pipeline/job of each change.
 
 Both scripts are idempotent and decide what to do from the live environment
 state plus this file, so any job can simply be re-run:
@@ -179,8 +217,13 @@ state plus this file, so any job can simply be re-run:
   it `HIBERNATED`;
 * startup failed while creating or loading → state stays `RESTORING`; the next
   run creates/replaces as needed and loads (Composer resumes partial loads);
-* a shutdown while a restore is incomplete never replaces the last good
-  restore point with a snapshot of an empty environment;
+* the load finished server-side after the job gave up, or the final `ACTIVE`
+  write failed → the next startup sees the completed load operation and only
+  marks the environment `ACTIVE`; the evening shutdown treats the restore as
+  complete;
+* a shutdown while a restore is incomplete, or of an environment re-created
+  empty while hibernated, never replaces the last good restore point with a
+  snapshot of an empty environment;
 * someone ran the normal deploy pipeline at night (fresh, empty environment) →
   startup still loads the snapshot into it.
 
@@ -252,7 +295,9 @@ Notes from GitLab's behaviour:
   start early enough before working hours.
 * Optional schedule variable `HIBERNATE_ENVIRONMENTS=composer-dev,composer-qa`
   restricts a schedule to some environments — e.g. different hours per team
-  (create more schedules).
+  (create more schedules). A value that names no environment (empty, `,`) is
+  refused rather than meaning "all"; delete the variable to select every
+  enabled environment.
 * Setting schedule variables requires the project's "minimum role to use
   pipeline variables" (Maintainer by default).
 * Set the resource group to `oldest_first` once it exists (after the first
@@ -267,15 +312,27 @@ pipeline source).
 
 ### 4.4 Manual runs
 
-*Build → Pipelines → Run pipeline*:
+*Build → Pipelines → Run pipeline* on the **default branch**:
 
 * `HIBERNATE_ACTION=shutdown` / `startup` — runs that job immediately;
 * `HIBERNATE_ACTION=dry-run` — read-only rehearsal (plans, no changes);
 * no variable — the normal pipeline plus manual buttons for all three.
 
+Shutdown and startup do not run on other branches or tags (like `dev-apply`):
+they would apply that ref's unreviewed YAML and code to the shared dev state —
+for example hibernate an environment that the default branch never restores.
+The dry-run is read-only and available on any branch; its startup half only
+plans a recreate for environments that are absent, so run it while they are
+hibernated to rehearse that plan. These rules guard against accidents, not
+against someone who can push a branch (they can edit the rules there). A real
+boundary needs a separate WIF provider / service account for the apply and
+hibernation jobs with an attribute condition such as
+`assertion.ref_protected == "true"`, and a read-only identity for MR plans.
+
 Job artifacts (`.hibernation/`, 30 days) contain the resolved settings, every
 Terraform plan (`.tfplan`, `.txt`, `.json`), per-environment logs, copies of
-the state files and `summary.json`.
+the state files and `summary.json`. Each job writes to its own
+`.hibernation/<job>-<job id>/`.
 
 ---
 
@@ -291,31 +348,45 @@ scripts/hibernation/composer-startup.sh  --config configs/development.yaml --env
 
 | Option | |
 |---|---|
+Command-line options replace the corresponding environment variables.
+
+| Option | |
+|---|---|
 | `-c, --config FILE` | The module's YAML (or `HIBERNATE_CONFIG_FILE`). |
-| `-e, --env KEY[,KEY]` | Only these environments (or `HIBERNATE_ENVIRONMENTS`). Default: all with `hibernation.enabled: true`. |
-| `-n, --dry-run` | Inspect and plan only. |
-| `--var-file FILE` | Extra `-var-file` for Terraform (repeatable). |
-| `--skip-init` | Terraform is already initialised. |
-| `--work-dir DIR` | Where logs/plans/summary go. |
+| `-e, --env KEY[,KEY]` | Only these environments (repeatable; replaces `HIBERNATE_ENVIRONMENTS`). Default: all with `hibernation.enabled: true`. A value naming no environment is an error. |
+| `-n, --dry-run` | Inspect and plan only (or `HIBERNATE_DRY_RUN=true`). |
+| `--var-file FILE` | Extra `-var-file` for Terraform (repeatable; replaces `HIBERNATE_TF_VAR_FILES`). |
+| `--skip-init` | Terraform is already initialised (or `HIBERNATE_SKIP_INIT=true`). |
+| `--work-dir DIR` | Where logs/plans/summary go (or `HIBERNATE_WORK_DIR`). Must be new or empty for every run; default `$TF_ROOT/.hibernation/<mode>-<timestamp>-<pid>`. |
 | `--force-delete-without-snapshot` | shutdown: delete `ERROR` environments (restore uses the previous snapshot). |
-| `--allow-initial-create` | startup: allow creating an environment Terraform has never deployed. |
-| `--skip-load` | startup: recreate without loading the snapshot. |
+| `--allow-initial-create` | startup: allow creating an environment without its hibernation state file (first deployment, or knowingly starting empty). |
+| `--skip-load` | startup: load nothing — recreated environments start empty, running ones are kept as they are; the next shutdown's snapshot becomes the restore point. |
+| `--force-load` | startup: load the snapshot even into an environment running for longer than `HIBERNATE_FRESH_ENV_HOURS` (overwrites its Airflow database). |
 
 | Environment variable | Default | |
 |---|---|---|
+| `HIBERNATE_CONFIG_FILE`, `HIBERNATE_ENVIRONMENTS`, `HIBERNATE_DRY_RUN`, `HIBERNATE_SKIP_INIT`, `HIBERNATE_TF_VAR_FILES`, `HIBERNATE_WORK_DIR` | — | Same as the options above (`HIBERNATE_ENVIRONMENTS` set but naming no environment is refused). |
 | `TF_ROOT` | repository root | Terraform root module. |
 | `TF_MODULE_ADDRESS` | `module.composer` | Address of the module call (if you wrap this module differently). |
 | `TF_BACKEND_BUCKET` / `TF_BACKEND_PREFIX` | — | GCS backend; a git-ignored `backend_override.tf` is generated when the root declares no backend, and init is verified to have selected `gcs`. |
 | `TF_LOCK_TIMEOUT` | `20m` | |
 | `HIBERNATE_OPERATION_TIMEOUT_MINUTES` | `90` | Snapshot save/load timeout. |
 | `HIBERNATE_WAIT_TIMEOUT_MINUTES` | `60` | Waiting for `CREATING`/`UPDATING`/`DELETING`. |
-| `HIBERNATE_POLL_SECONDS` | `30` | Also the log heartbeat interval. |
+| `HIBERNATE_POLL_SECONDS` | `30` | Polling interval. In the parallel snapshot/load phases each environment's log is printed when its batch finishes (live in `logs/<key>-<phase>.log`). |
+| `HIBERNATE_POLL_FAILURE_GRACE_SECONDS` | `900` | Keep polling a running snapshot/load through API or network errors for this long. |
 | `HIBERNATE_MAX_PARALLEL` | `4` | Concurrent snapshot/load operations. |
 | `HIBERNATE_LOAD_ATTEMPTS` | `2` | A retried load resumes a partial one. |
+| `HIBERNATE_FRESH_ENV_HOURS` | `96` | An environment found running while the state file says it is hibernated counts as new and empty up to this age (covers a deploy on Friday evening and a startup after a long weekend). |
+| `HIBERNATE_GCLOUD_RETRIES` / `HIBERNATE_RETRY_SLEEP_SECONDS` | `3` / `10` | Attempts per gcloud call and the pause between them (plus jitter). |
 | `HIBERNATE_SKIP_IMAGE_CHECK` | `false` | Skip the "can it be re-created?" check. |
+| `HIBERNATE_COMPOSER_API` | `https://composer.googleapis.com` | Composer REST endpoint for the image version listing. |
+| `HIBERNATE_LOCK_TIMEOUT_SECONDS` | `600` | Wait for the job-local lock that serialises snapshot-bucket IAM changes. |
 
-Exit codes: `0` success or nothing to do, `1` at least one environment failed
-(the others are still processed), `2` usage/configuration error.
+Exit codes: `0` success or nothing to do; `1` at least one environment failed
+(the others are still processed) — including an environment whose own
+settings are invalid, production, disabled or not eligible; `2` bad arguments,
+an unknown environment key, an unreadable YAML, a reused work dir, or a
+Terraform init/state prerequisite failure.
 
 Requirements: bash 4.3+, terraform ≥ 1.6, gcloud, jq, curl, coreutils.
 
@@ -336,7 +407,12 @@ Requirements: bash 4.3+, terraform ≥ 1.6, gcloud, jq, curl, coreutils.
   Manager secrets (unaffected), Composer user-workloads Secrets/ConfigMaps.
 * **Regular deploys while hibernated** (`dev-apply` at night) recreate the
   environment without data; the next startup detects this and loads the
-  snapshot into it.
+  snapshot into it, and a shutdown before that keeps the good restore point.
+  If such an environment keeps running for longer than
+  `HIBERNATE_FRESH_ENV_HOURS` (e.g. hibernation was disabled for weeks), it is
+  assumed to hold real work: startup refuses to overwrite it (decide with
+  `--skip-load` / `--force-load`) and shutdown makes its snapshot the restore
+  point.
 * **Snapshot limits:** Airflow database < 20 GB, < 100,000 objects in
   `dags/`+`plugins/`+`data/`. Use `data_retention` to keep the database small.
 * **Outputs while hibernated:** `terraform output` keeps stale values for a
@@ -345,8 +421,9 @@ Requirements: bash 4.3+, terraform ≥ 1.6, gcloud, jq, curl, coreutils.
   for some Airflow versions, but cannot be created by the Terraform provider and
   have tight limits — this snapshot-based approach works for any Composer 3
   environment the module creates.
-* **Holidays:** deactivate the startup schedule (or remove the environment from
-  `HIBERNATE_ENVIRONMENTS`) for days nobody works.
+* **Holidays:** deactivate the startup schedule for days nobody works. Do not
+  empty `HIBERNATE_ENVIRONMENTS` instead: a list naming no environment is
+  refused, and deleting the variable selects *every* enabled environment.
 
 ---
 
@@ -360,7 +437,14 @@ Requirements: bash 4.3+, terraform ≥ 1.6, gcloud, jq, curl, coreutils.
 | `no resources of module.composer["…"] in the Terraform state` (startup) | Same; or a brand-new environment → `--allow-initial-create`. |
 | `plan guard: …` | The plan wanted to change something outside the hibernating environments (pending YAML changes, drift). Apply them through the normal pipeline first. |
 | `environment is in ERROR state` (shutdown) | Fix it, or `--force-delete-without-snapshot` (restores the previous snapshot). |
-| startup: `only load into the same or a later Airflow version` | The recreated environment runs an older Airflow version than the snapshot; fix `image_version` and re-run startup (state stays `RESTORING`). |
+| startup: `only load into the same or a later Airflow version` | The recreated environment runs an older Airflow version than the snapshot (state stays `RESTORING`). Startup does not change a running environment's image, so a re-run alone does not help: set a compatible `image_version`, apply it with the normal deploy (in-place upgrade) or delete the environment, then re-run startup. |
+| `… the Terraform state but the YAML resolves to …` / `disagree on which environment` | The state holds a different environment than the YAML names: apply the pending rename/move first, fix a duplicated `environment_name`, or check the backend. |
+| `… is also defined by: …` | Two YAML keys resolve to the same project/region/name. |
+| `would overwrite its Airflow database` (startup) | The environment has been running for a long time although the state file says hibernated. `--skip-load` keeps it (`ACTIVE`), `--force-load` loads the snapshot over it. |
+| `no hibernation state file at …` (startup) | The state file is not where the settings point (`snapshot_bucket`/`snapshot_prefix` changed?). Move the old folder there, or `--allow-initial-create` to start empty. |
+| `already holds the files of an earlier run` | Use a new, empty `--work-dir` / `HIBERNATE_WORK_DIR` per run. |
+| `names no environment` | `--env` or `HIBERNATE_ENVIRONMENTS` is empty; delete the variable for "all enabled environments". |
+| `GCP's default image …` | `pin_image_version: false` without a YAML version and GCP's default cannot load the snapshot (or is not Composer 3). Pin `software_config.image_version`. |
 | `PERMISSION_DENIED` on snapshot save/load | The environment's service account lacks access to the snapshot bucket (the scripts grant it; check org policies / custom bucket IAM). |
 | Job killed after 1 h | Raise the runner's maximum timeout (jobs need up to 3 h). |
 
@@ -380,11 +464,19 @@ terraform test                # module/root tests incl. hibernation settings & g
   round-trip, idempotency, retention, orphaned buckets, every failure point
   (snapshot, Terraform, plan guard, load, ERROR environments, interrupted
   restores, version/creatability checks), dry-runs and guard-rails.
+  Each review finding has a scenario that reproduces it (they fail against the
+  scripts before the fix): re-created environments while hibernated, stale
+  `RESTORING`, reused work dirs, state/YAML identity mismatches, a moved state
+  file, protected orphan buckets, vanished snapshots, API outages while
+  polling, and more.
 * `tests/hibernation/unit.bats` — library functions and decision tables, plan
   guards against real Terraform plan JSON (`fixtures/plans/`).
+* `tests/hibernation/regression.bats` — the `pipefail` + `grep -q` SIGPIPE trap
+  on large states.
 * `tests/hibernation/resolver.bats` — the offline settings resolver.
 * `tests/ci/test_pipeline_rules.sh` — which jobs run for schedule/web/push/MR
-  pipelines (needs [gitlab-ci-local](https://github.com/firecow/gitlab-ci-local)).
+  pipelines, on the default branch, another branch and a tag (needs
+  [gitlab-ci-local](https://github.com/firecow/gitlab-ci-local)).
 * `tests/ci/validate_gitlab_ci.py` — GitLab CI JSON-schema validation.
 * `tests/ci/schedules.bats` — the schedule helper against a fake GitLab API.
 

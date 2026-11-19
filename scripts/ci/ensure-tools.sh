@@ -28,7 +28,7 @@ pkg_install() {
 }
 
 have jq || need+=(jq)
-have unzip || need+=(unzip)
+have terraform || have unzip || need+=(unzip) # only to unpack a terraform download
 have curl || need+=(curl)
 if [[ "${ENSURE_TEST_TOOLS:-false}" == true ]]; then
   have bats || need+=(bats)

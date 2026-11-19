@@ -186,6 +186,11 @@ DESCRIPTION_PREFIX="$(trim "${DESCRIPTION_PREFIX}")"
 RESOURCE_GROUP="$(trim "${RESOURCE_GROUP}")"
 [[ -n "${RESOURCE_GROUP}" ]] || usage_error "RESOURCE_GROUP must not be empty"
 ENVIRONMENTS="$(trim "${ENVIRONMENTS}")"
+# The hibernation scripts refuse a list that names no environment (e.g. ","),
+# so never store one; empty = delete the variable = every enabled environment.
+if [[ -n "${ENVIRONMENTS}" && -z "$(tr ',[:space:]' '\n' <<<"${ENVIRONMENTS}" | sed '/^$/d')" ]]; then
+  usage_error "ENVIRONMENTS '${ENVIRONMENTS}' names no environment (leave it empty for every enabled environment)"
+fi
 for v in REF TIMEZONE DESCRIPTION_PREFIX ENVIRONMENTS RESOURCE_GROUP; do
   [[ ! "${!v}" =~ [[:cntrl:]] ]] || usage_error "${v} contains control characters"
 done

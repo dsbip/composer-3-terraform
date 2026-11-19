@@ -38,6 +38,9 @@ hibernation:
   create_snapshot_bucket: true
 
   # Folder inside the bucket; snapshots go to <prefix>/<project>/<region>/<env-name>/.
+  # Change snapshot_bucket / snapshot_prefix only while the environments are running,
+  # or move the old folder (state file + snapshots) first: startup refuses to create
+  # an empty environment when the state file is missing.
   snapshot_prefix: "composer-hibernation"
 
   # Snapshots kept per environment (>= 1); the current restore point is never pruned.
@@ -46,7 +49,8 @@ hibernation:
   # Without software_config.image_version, recreate on the snapshot's Airflow version.
   pin_image_version: true
 
-  # Delete the auto-created environment bucket a deletion leaves behind (never storage.bucket).
+  # Delete the auto-created environment bucket a deletion leaves behind (never a bucket
+  # that any storage.bucket or snapshot_bucket in this file uses).
   delete_orphaned_bucket: true
 
   # Grace period in days before an orphaned bucket (and its task logs) is deleted; 0 = at once.

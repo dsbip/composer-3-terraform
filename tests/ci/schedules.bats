@@ -256,6 +256,16 @@ sched() {
 }
 
 # ── ENVIRONMENTS ────────────────────────────────────────────────────────────
+@test "ENVIRONMENTS naming no environment (e.g. ',') is a usage error and makes no requests" {
+  local v
+  for v in "," " , " ",,"; do
+    ENVIRONMENTS="${v}" run "${SCRIPT}"
+    [ "${status}" -eq 2 ]
+    [[ "${output}" == *"names no environment"* ]]
+  done
+  [ "$(requests 'length')" -eq 0 ]
+}
+
 @test "ENVIRONMENTS adds HIBERNATE_ENVIRONMENTS, updates it, and deletes it once unset" {
   ENVIRONMENTS="composer-dev,composer-qa" run "${SCRIPT}"
   [ "${status}" -eq 0 ]

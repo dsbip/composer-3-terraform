@@ -49,6 +49,9 @@ ACTION_DIR=""
 preflight() {
   local key="$1" state status has_snapshot action rc
   info "[${key}] preflight"
+  # Only what this run decides may drive it (init_work_dir also refuses a
+  # work dir holding an earlier run's files).
+  rm -f "${ACTION_DIR}/${key}" "$(phase_marker "${key}" snapshot)"
   check_environment_eligible "${key}" || {
     result_set "${key}" failed "not eligible for hibernation (see log)"
     return 0
@@ -76,6 +79,12 @@ preflight() {
       result_set "${key}" failed "environment exists but $(tf_address "${key}") is not in the Terraform state (wrong backend/state?) — not touching it"
       return 0
     fi
+    # The destroy removes the object in the state; it must be the environment
+    # that gets snapshotted.
+    if ! check_state_identity "${key}"; then
+      result_set "${key}" failed "the Terraform state and the YAML disagree on which environment this is (see log) — not touching it"
+      return 0
+    fi
     # Never delete what cannot be brought back tomorrow: the restore image
     # must still be creatable and able to load the snapshot.
     local current
@@ -88,7 +97,11 @@ preflight() {
     ;;
   mark_hibernated)
     if [[ "${OPT_DRY_RUN}" != true ]]; then
-      handle_orphaned_buckets "${key}" false
+      # SNAPSHOT_SAVED: an earlier shutdown deleted the environment but never
+      # finished; the newest snapshot entry names the bucket it left behind.
+      local orphan=""
+      [[ "${status}" == SNAPSHOT_SAVED ]] && orphan="$(manifest_get "${key}" '.snapshots[0].environment_bucket')"
+      handle_orphaned_buckets "${key}" "${orphan}"
       manifest_transition "${key}" HIBERNATED "environment already absent; latest snapshot kept for restore" ||
         {
           result_set "${key}" failed "could not update the state file"
@@ -100,7 +113,7 @@ preflight() {
     ;;
   noop_hibernated)
     if [[ "${OPT_DRY_RUN}" != true ]] && [[ "$(manifest_get "${key}" '.orphaned_buckets | length')" != 0 ]]; then
-      handle_orphaned_buckets "${key}" false
+      handle_orphaned_buckets "${key}" ""
       manifest_push "${key}" || true
     fi
     result_set "${key}" skipped "already hibernated"
@@ -145,30 +158,57 @@ snapshot_env() {
   }
 
   info "[${key}] saving snapshot of ${name} to ${location}/"
-  path="$(composer_snapshot_save "${name}" "${region}" "${project}" "${location}")" || {
+  local op_file="${OPT_WORK_DIR}/state/${key}.save-operation"
+  rm -f "${op_file}"
+  path="$(composer_snapshot_save "${name}" "${region}" "${project}" "${location}" "${op_file}")" || {
+    track_abandoned_save "${key}" "${op_file}"
     result_set "${key}" failed "snapshot save failed; environment NOT deleted"
     return 0
   }
   if ! retry snapshot_is_complete "${path}"; then
+    # Recorded so retention deletes the incomplete folder later.
+    manifest_update "${key}" '.snapshots = ((.snapshots // []) + [{path: $p, saved_at: $t, incomplete: true}])' \
+      --arg p "${path}" --arg t "$(_ts)"
+    manifest_push "${key}" || true
     result_set "${key}" failed "snapshot ${path} has no Airflow database dump (*.sql.gz); environment NOT deleted"
     return 0
   fi
   info "[${key}] snapshot verified: ${path}"
 
-  # A snapshot taken while a restore is still incomplete (state RESTORING)
-  # must not replace the last good snapshot as the restore point.
+  # Does this snapshot become the restore point? Not when the environment
+  # never received the current restore point: a restore that is still
+  # incomplete (RESTORING), or an environment re-created empty (e.g. by a
+  # deploy) while hibernated — unless it has been running long enough to
+  # hold real work.
+  local latest recreated=false fresh=false done=false decision
   status="$(manifest_get "${key}" .status)"
+  latest="$(manifest_get "${key}" .latest_snapshot.path)"
+  env_recreated_since_snapshot "${key}" && recreated=true
+  env_is_fresh "${key}" && fresh=true
+  [[ "${status}" == RESTORING && "$(restore_attempt_state "${key}")" == SUCCEEDED ]] && done=true
+  decision="$(decide_restore_point "${status:-NONE}" "${recreated}" "${fresh}" "${done}" "$([[ -n "${latest}" ]] && echo true || echo false)")"
   restore_incomplete=false
-  if [[ "${status}" == RESTORING && -n "$(manifest_get "${key}" .latest_snapshot.path)" ]]; then
+  case "${decision}" in
+  keep)
     restore_incomplete=true
-    warn "[${key}] the previous restore never completed; keeping $(manifest_get "${key}" .latest_snapshot.path) as the restore point and recording ${path} as a secondary snapshot"
-  fi
+    if [[ "${status}" == RESTORING ]]; then
+      warn "[${key}] the previous restore never completed; keeping ${latest} as the restore point and recording ${path} as a secondary snapshot"
+    else
+      warn "[${key}] the environment was re-created (created $(describe_get "${key}" .createTime)) after the restore point was taken and never restored; keeping ${latest} as the restore point and recording ${path} as a secondary snapshot"
+    fi
+    ;;
+  replace_stale)
+    warn "[${key}] the state file says ${status}, but the environment has been running since $(describe_get "${key}" .createTime) (over ${HIBERNATE_FRESH_ENV_HOURS}h) outside the hibernation cycle; treating it as holding real work: ${path} becomes the restore point (the previous one, ${latest}, is kept until retention prunes it)"
+    ;;
+  esac
 
   entry="$(jq -n --arg path "${path}" --arg at "$(_ts)" --arg image "${image}" \
     --arg airflow "$(airflow_version_of "${image}")" --arg bucket "${bucket}" \
     --arg dags "${dag_prefix}" --arg sa "${sa}" --argjson incomplete "${restore_incomplete}" \
+    --arg uuid "$(describe_get "${key}" .uuid)" --arg created "$(describe_get "${key}" .createTime)" \
     '{path: $path, saved_at: $at, image_version: $image, airflow_version: $airflow,
       environment_bucket: $bucket, dag_gcs_prefix: $dags, service_account: $sa,
+      environment_uuid: $uuid, environment_created: $created,
       restore_incomplete: $incomplete}')"
   if [[ "${restore_incomplete}" == true ]]; then
     manifest_update "${key}" '.snapshots = ([$e] + (.snapshots // []))' --argjson e "${entry}"
@@ -183,32 +223,75 @@ snapshot_env() {
 }
 
 # ── Phase 4 helpers ─────────────────────────────────────────────────────────
-# handle_orphaned_buckets KEY RECORD
+# A save that was accepted but then abandoned (poll failures, timeout) keeps
+# running server-side; remember it so its folder is tracked and pruned.
+track_abandoned_save() {
+  local key="$1" op_file="$2" op
+  [[ -s "${op_file}" ]] || return 0
+  op="$(cat "${op_file}")"
+  manifest_update "${key}" '.pending_saves = ((.pending_saves // []) + [{operation: $op, at: $t}])' \
+    --arg op "${op}" --arg t "$(_ts)"
+  manifest_push "${key}" || true
+}
+
+# Resolves pending_saves: a finished save's folder joins the snapshot list
+# (untracked, never a restore point) so retention deletes it eventually.
+resolve_pending_saves() {
+  local key="$1" op at out path region project err
+  err="${OPT_WORK_DIR}/logs/${key}-pending-saves.log"
+  region="$(setting "${key}" .region)"
+  project="$(setting "${key}" .project_id)"
+  while IFS=$'\t' read -r op at; do
+    [[ -n "${op}" ]] || continue
+    if ! out="$(gcloud composer operations describe "${op##*/}" --location="${region}" --project="${project}" \
+      --format=json 2>"${err}")"; then
+      is_not_found_error "$(cat "${err}")" || continue # transient: try again next time
+      out='{"done": true}'                             # operations expire: forget it
+    fi
+    [[ "$(jq -r '.done // false' <<<"${out}")" == true ]] || continue
+    path="$(jq -r '.response.snapshotPath // empty' <<<"${out}")"
+    path="${path%/}"
+    if [[ -n "${path}" ]]; then
+      info "[${key}] abandoned snapshot save ${op##*/} finished: tracking ${path} for retention"
+      manifest_update "${key}" '.snapshots = ([{path: $p, saved_at: $t, untracked: true}] + (.snapshots // []))' \
+        --arg p "${path}" --arg t "${at}"
+    fi
+    manifest_update "${key}" '.pending_saves = [(.pending_saves // [])[] | select(.operation != $op)]' --arg op "${op}"
+  done < <(jq -r '.pending_saves[]? | "\(.operation)\t\(.at)"' "$(manifest_local_path "${key}")")
+}
+
+# Buckets that must never be deleted: every environment's storage.bucket and
+# snapshot bucket in the YAML (any key — another environment may use it now).
+protected_buckets() {
+  jq -r '[.[] | .custom_bucket // empty, .hibernation.snapshot_bucket // empty] | unique[]' "${RESOLVED_JSON}"
+}
+
+# handle_orphaned_buckets KEY [BUCKET_TO_RECORD]
 # Deleting a Composer environment leaves its auto-created bucket behind (and a
-# restore creates a new one). With RECORD=true the bucket of the environment
-# just deleted is recorded; recorded buckets older than
+# restore creates a new one). BUCKET_TO_RECORD (the bucket of the environment
+# just deleted) is recorded; recorded buckets older than
 # hibernation.orphaned_bucket_retention_days are deleted (their dags/, plugins/
 # and data/ are in the snapshot; the grace period keeps task logs around).
+# Every recorded bucket is re-checked against the protected buckets right
+# before deletion — the YAML may have started using it since.
 handle_orphaned_buckets() {
-  local key="$1" record="$2" bucket region name snap_bucket custom days now orphaned_epoch err
+  local key="$1" bucket="${2:-}" region name snap_bucket custom days now orphaned_epoch err protected
   [[ "$(setting "${key}" .hibernation.delete_orphaned_bucket)" == true ]] || return 0
   custom="$(setting "${key}" .custom_bucket)"
-  if [[ "${record}" == true ]]; then
-    if [[ -n "${custom}" ]]; then
+  protected="$(protected_buckets)"
+  if [[ -n "${bucket}" ]]; then
+    region="$(setting "${key}" .region)"
+    name="$(setting "${key}" .environment_name)"
+    snap_bucket="$(setting "${key}" .hibernation.snapshot_bucket)"
+    if [[ -n "${custom}" && "${bucket}" == "${custom}" ]]; then
       info "[${key}] environment uses storage.bucket ${custom}; it is reused on restore and kept"
+    elif is_safe_orphan_bucket "${bucket}" "${region}" "${name}" "${snap_bucket}" "${custom}" &&
+      ! grep -Fxq -- "${bucket}" <<<"${protected}"; then
+      manifest_update "${key}" '.orphaned_buckets = ((.orphaned_buckets // []) | map(select(.bucket != $b)))
+          + [{bucket: $b, orphaned_at: $t, orphaned_epoch: $e}]' \
+        --arg b "${bucket}" --arg t "$(_ts)" --argjson e "$(now_epoch)"
     else
-      bucket="$(describe_get "${key}" .storageConfig.bucket)"
-      [[ -n "${bucket}" ]] || bucket="$(bucket_from_gcs_uri "$(describe_get "${key}" .config.dagGcsPrefix)")"
-      region="$(setting "${key}" .region)"
-      name="$(setting "${key}" .environment_name)"
-      snap_bucket="$(setting "${key}" .hibernation.snapshot_bucket)"
-      if is_safe_orphan_bucket "${bucket}" "${region}" "${name}" "${snap_bucket}" "${custom}"; then
-        manifest_update "${key}" '.orphaned_buckets = ((.orphaned_buckets // []) | map(select(.bucket != $b)))
-            + [{bucket: $b, orphaned_at: $t, orphaned_epoch: $e}]' \
-          --arg b "${bucket}" --arg t "$(_ts)" --argjson e "$(now_epoch)"
-      else
-        warn "[${key}] not scheduling bucket '${bucket:-<unknown>}' for deletion: it does not look like this environment's auto-created bucket"
-      fi
+      warn "[${key}] not scheduling bucket '${bucket}' for deletion: it does not look like this environment's auto-created bucket"
     fi
   fi
 
@@ -217,6 +300,11 @@ handle_orphaned_buckets() {
   err="${OPT_WORK_DIR}/logs/${key}-bucket-delete.log"
   while IFS=$'\t' read -r bucket orphaned_epoch; do
     [[ -n "${bucket}" ]] || continue
+    if grep -Fxq -- "${bucket}" <<<"${protected}"; then
+      info "[${key}] gs://${bucket} is now in use (storage.bucket or snapshot bucket in the YAML); no longer treated as orphaned"
+      manifest_update "${key}" '.orphaned_buckets = [.orphaned_buckets[] | select(.bucket != $b)]' --arg b "${bucket}"
+      continue
+    fi
     if ((now - orphaned_epoch < days * 86400)); then
       info "[${key}] keeping orphaned bucket gs://${bucket} for $(((days * 86400 - (now - orphaned_epoch) + 86399) / 86400)) more day(s)"
       continue
@@ -231,20 +319,26 @@ handle_orphaned_buckets() {
 }
 
 prune_snapshots() {
-  local key="$1" keep latest path
+  local key="$1" keep latest path rc
+  resolve_pending_saves "${key}"
   keep="$(setting "${key}" .hibernation.snapshot_retention_count)"
   latest="$(manifest_get "${key}" .latest_snapshot.path)"
   # Never prune the restore point, whatever its position in the list.
+  # Incomplete snapshots (no database dump) are of no use and always go.
   while IFS= read -r path; do
     [[ -n "${path}" && "${path}" != "${latest}" ]] || continue
     info "[${key}] pruning snapshot ${path} (retention: ${keep})"
-    if retry gcs_delete_prefix "${path}"; then
+    retry gcs_delete_prefix "${path}" && rc=0 || rc=$?
+    if ((rc == 0 || rc == HIB_RC_NOT_FOUND)); then
+      ((rc == 0)) || info "[${key}] ${path} was already gone"
       manifest_update "${key}" '.snapshots = [.snapshots[] | select(.path != $p)]' --arg p "${path}"
     else
       warn "[${key}] could not delete ${path}; will retry next time"
     fi
   done < <(jq -r --argjson keep "${keep}" --arg latest "${latest}" \
-    '[.snapshots[]? | select(.path != $latest)] | .[($keep - 1 | if . < 0 then 0 else . end):][] | .path' \
+    '[.snapshots[]? | select(.path != $latest)]
+     | ([.[] | select(.incomplete == true)] + ([.[] | select(.incomplete != true)] | .[($keep - 1 | if . < 0 then 0 else . end):]))
+     | .[].path' \
     "$(manifest_local_path "${key}")")
 }
 
@@ -254,7 +348,6 @@ main() {
   require_cmds terraform gcloud jq realpath comm awk
   init_work_dir shutdown
   ACTION_DIR="${OPT_WORK_DIR}/actions"
-  mkdir -p "${ACTION_DIR}"
   [[ "${OPT_DRY_RUN}" == true ]] && warn "DRY RUN — nothing will be changed"
 
   resolve_config
@@ -293,7 +386,10 @@ main() {
   if ((${#snap_keys[@]})); then
     run_parallel snapshot snapshot_env "${snap_keys[@]}"
     for key in "${snap_keys[@]}"; do
-      phase_done "${key}" snapshot && delete_keys+=("${key}")
+      # Deleted only with a snapshot verified IN THIS RUN and no failure.
+      if phase_done "${key}" snapshot && ! has_result "${key}"; then
+        delete_keys+=("${key}")
+      fi
     done
   fi
 
@@ -312,6 +408,8 @@ main() {
     else
       for key in "${delete_keys[@]}"; do
         plan_must_contain "${OPT_WORK_DIR}/plans/destroy.json" "$(tf_address "${key}")" delete || tf_ok=false
+        plan_deletes_identity "${OPT_WORK_DIR}/plans/destroy.json" "$(tf_address "${key}")" "$(settings_identity "${key}")" ||
+          tf_ok=false
       done
     fi
     if [[ "${tf_ok}" != true ]]; then
@@ -354,9 +452,13 @@ main() {
         # restore point, so it is kept for manual recovery.
         if [[ "$(cat "${ACTION_DIR}/${key}")" == delete_only ]]; then
           warn "[${key}] forced delete: keeping the environment bucket for manual recovery"
-          handle_orphaned_buckets "${key}" false
+          handle_orphaned_buckets "${key}" ""
         else
-          handle_orphaned_buckets "${key}" true
+          # (describe output from preflight = the environment just deleted)
+          local old_bucket
+          old_bucket="$(describe_get "${key}" .storageConfig.bucket)"
+          [[ -n "${old_bucket}" ]] || old_bucket="$(bucket_from_gcs_uri "$(describe_get "${key}" .config.dagGcsPrefix)")"
+          handle_orphaned_buckets "${key}" "${old_bucket}"
         fi
         prune_snapshots "${key}"
         if ! manifest_transition "${key}" HIBERNATED "environment deleted"; then

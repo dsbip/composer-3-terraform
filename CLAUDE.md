@@ -9,7 +9,7 @@ Terraform module for deploying one or more Google Cloud Composer 3 environments 
 ### Multi-environment via for_each
 - Root module parses the YAML and iterates `environments` map with `for_each`
 - Each environment key becomes the module instance key and default environment name
-- The child module receives three inputs: `environment_key` (string), `config` (per-env map), `global_config` (shared defaults)
+- The child module receives `environment_key` (string), `config` (per-env map), `global_config` (shared defaults) and `fallback_image_version` (only fills a null YAML `image_version`; set by the hibernation startup)
 - Adding/removing environments is a YAML edit — no Terraform code changes needed
 
 ### Global → per-environment config merging
@@ -22,7 +22,7 @@ Terraform module for deploying one or more Google Cloud Composer 3 environments 
 - **Environment size**: `ENVIRONMENT_SIZE_SMALL`
 - **Network**: auto-created as `{env-name}-network` / `{env-name}-subnet` with standard CIDRs
 - **Service account**: auto-created as `{env-name}-sa` with minimal roles
-- **Image version**: `null` → GCP picks the latest stable Composer 3 image
+- **Image version**: `null` → GCP picks its default image (may still be Composer 2 during Google's rollout — pin one, see gotchas)
 - **Workloads**: scheduler (0.5 cpu/2GB), web_server (1 cpu/2GB), worker (1 cpu/2GB, 1-3 autoscale)
 - A completely empty environment config (`composer-basic: {}`) produces a working Composer instance
 
@@ -43,13 +43,16 @@ Three critical bindings beyond the SA's own roles:
 3. KMS encrypter/decrypter → Composer, Artifact Registry, and GCS agents (when CMEK enabled)
 
 ### Hibernation (scheduled snapshot + delete / recreate + load)
-- Opt-in per env via the `hibernation` block (global → per-env merge); refused for production (labels `env|environment|tier|stage` = `prod|production|prd`, else a prod token in the name) by a precondition on `google_composer_environment.this` and by the scripts
+- Opt-in per env via the `hibernation` block (global → per-env merge); refused for production (labels `env|environment|tier|stage` = `prod|production|prd`, else a prod token in the name) by the scripts and by a precondition on `google_composer_environment.this` (create/update plans only — Terraform skips preconditions in destroy plans, so shutdown relies on the scripts' check)
 - `modules/composer-3-settings` is provider-less and the single source of truth for identity/labels/hibernation resolution; `modules/composer-3` uses it, and `scripts/hibernation/resolver` evaluates it offline so the bash scripts never re-implement YAML defaults
 - Shutdown deletes ONLY `google_composer_environment` (resource-level `-target` in destroy mode is instance-precise); network/SA/IAM/KMS stay
 - Startup targets the whole module instance `module.composer["<key>"]` — resource-level create targets pull in same-named dependencies of ALL instances (verified), leaking other envs' pending changes
 - Plans are guarded (`guard_destroy_plan`, `guard_create_plan`, `plan_must_contain`) — a typo'd `-target` silently plans nothing
 - `var.fallback_image_versions` (root) / `fallback_image_version` (module) only fill a null YAML `image_version`; startup sets it to the snapshot's `composer-3-airflow-X.Y.Z` (snapshots load only into same-or-later Airflow)
-- Per-env state file `<snapshot_location>/hibernation-state.json` (SNAPSHOT_SAVED → HIBERNATED → RESTORING → ACTIVE) makes both scripts idempotent; see `decide_*_action` in `scripts/hibernation/lib/common.sh`
+- Per-env state file `<snapshot_location>/hibernation-state.json` (NONE → SNAPSHOT_SAVED → HIBERNATED → RESTORING → ACTIVE) makes both scripts idempotent; see `decide_*_action` in `scripts/hibernation/lib/common.sh`
+- Shutdown checks the state's project/region/name equals the YAML's before snapshotting (`check_state_identity`) and the destroy plan's `change.before` again (`plan_deletes_identity`); two keys resolving to one environment are refused
+- Restore point: `decide_restore_point` keeps the old one when the env never received it (RESTORING without a completed `restore_attempt`, or re-created while HIBERNATED/SNAPSHOT_SAVED — uuid differs); envs older than `HIBERNATE_FRESH_ENV_HOURS` (96) hold real work, so startup refuses to load over them (`refuse_stale`; `--skip-load`/`--force-load`)
+- The work dir's `actions/`, `state/`, `results/` drive a run, so `init_work_dir` refuses a non-empty one (CI uses `.hibernation/<job>-<job id>`)
 
 ### API enablement idempotency
 - Each module instance enables APIs independently via `google_project_service`
@@ -63,7 +66,7 @@ Three critical bindings beyond the SA's own roles:
 | `main.tf` (root) | YAML parsing, global config extraction, `for_each` module invocation |
 | `modules/composer-3/locals.tf` | Global merging, all defaults, derived values |
 | `modules/composer-3/main.tf` | `google_composer_environment` with all dynamic blocks |
-| `modules/composer-3/variables.tf` | `environment_key`, `config`, `global_config` inputs |
+| `modules/composer-3/variables.tf` | `environment_key`, `config`, `global_config`, `fallback_image_version` inputs |
 | `modules/composer-3/iam.tf` | Service account + Composer agent IAM |
 | `modules/composer-3/network.tf` | VPC, subnet, Cloud NAT, firewall |
 | `modules/composer-3/kms.tf` | CMEK key ring, key, IAM grants |
@@ -100,7 +103,7 @@ environments:
 - `terraform fmt -check -recursive` — formatting
 - `terraform validate` — syntax and configuration (root + test modules)
 - `tests/hibernation/run.sh` — shellcheck, GitLab CI schema + rule evaluation, bats unit/resolver/schedule tests and the e2e suite (real Terraform plans offline via `tests/hibernation/tools/stub_google_api.py`; only `apply` and GCP are simulated by `tests/hibernation/fakes/`)
-- `python tests/validate_configs.py` — YAML structure/constraint validation for all 5 configs
+- `python tests/validate_configs.py` — YAML structure/constraint validation for every file in `configs/`
 - `tests/*.tftest.hcl` — native tests with mock providers (Terraform >= 1.7); `expect_failures` cannot reference resources inside child modules, so module preconditions are tested with `module { source = "./modules/composer-3" }` runs
 - `terraform plan` — requires GCP credentials (validates provider interaction)
 
