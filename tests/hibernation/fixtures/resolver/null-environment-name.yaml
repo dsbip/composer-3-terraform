@@ -1,0 +1,8 @@
+# Resolver fixture: an explicit `environment_name: null` must fall back to the
+# environment key.
+project_id: "identity-project"
+
+environments:
+  composer-null-name:
+    environment_name: null
+    labels: { env: dev }

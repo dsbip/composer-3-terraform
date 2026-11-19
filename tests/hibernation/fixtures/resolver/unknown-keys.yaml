@@ -1,0 +1,18 @@
+# Resolver fixture: misspelt / unsupported hibernation settings must be
+# reported, not silently ignored.
+project_id: "unknown-keys-project"
+
+hibernation:
+  snapshot_retention: 30            # typo of snapshot_retention_count
+
+environments:
+  composer-typo:
+    labels: { env: dev }
+    hibernation:
+      enabled: true
+      snapshot_retension_count: 30  # typo of snapshot_retention_count
+  composer-load-options-not-a-map:
+    labels: { env: dev }
+    hibernation:
+      enabled: true
+      load_options: false           # must be a map of skip_* flags

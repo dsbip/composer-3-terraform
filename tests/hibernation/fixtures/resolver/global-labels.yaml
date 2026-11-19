@@ -1,0 +1,15 @@
+# Resolver fixture: production label inherited from the global labels.
+project_id: "global-labels-project"
+
+labels:
+  env: production
+  managed_by: terraform
+
+environments:
+  # Inherits env: production -> production.
+  composer-analytics: {}
+
+  # Per-env env: dev overrides the global production label -> not production.
+  composer-sandbox:
+    labels:
+      env: dev

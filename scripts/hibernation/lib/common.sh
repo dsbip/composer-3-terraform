@@ -102,11 +102,13 @@ now_epoch() { date -u +%s; }
 # Runs "$@" up to HIBERNATE_GCLOUD_RETRIES times; stdout of the last attempt
 # is passed through. Not-found (rc 3 from our wrappers) is never retried.
 retry() {
-  local attempt=1 rc=0
+  local attempt=1 rc=0 out
+  out="$(mktemp)"
   while :; do
-    "$@" && return 0
-    rc=$?
-    if ((rc == HIB_RC_NOT_FOUND)) || ((attempt >= HIBERNATE_GCLOUD_RETRIES)); then
+    "$@" >"${out}" && rc=0 || rc=$?
+    if ((rc == 0 || rc == HIB_RC_NOT_FOUND || attempt >= HIBERNATE_GCLOUD_RETRIES)); then
+      cat "${out}"
+      rm -f "${out}"
       return "${rc}"
     fi
     warn "attempt ${attempt}/${HIBERNATE_GCLOUD_RETRIES} failed (rc=${rc}): $*; retrying in ${HIBERNATE_RETRY_SLEEP_SECONDS}s"
@@ -172,16 +174,17 @@ bucket_from_gcs_uri() {
 # Only buckets that look like Composer-created environment buckets
 # ("<region>-<env-name...>-<hash>-bucket") may be deleted automatically.
 is_safe_orphan_bucket() {
-  local bucket="$1" region="$2" env_name="$3" snapshot_bucket="$4" custom_bucket="$5"
-  [[ -n "${bucket}" ]] || return 1
+  local bucket="$1" region="$2" env_name="$3" snapshot_bucket="$4" custom_bucket="$5" re name_part
+  [[ -n "${bucket}" && -n "${region}" && -n "${env_name}" ]] || return 1
   [[ "${bucket}" != "${snapshot_bucket}" ]] || return 1
   [[ -z "${custom_bucket}" || "${bucket}" != "${custom_bucket}" ]] || return 1
-  [[ "${bucket}" == "${region}-"*"-bucket" ]] || return 1
-  # Composer truncates long environment names inside the bucket name, so
-  # only require the first 10 characters of the name to be present.
-  local stem="${env_name:0:10}"
-  [[ "${bucket}" == "${region}-${stem}"* ]] || return 1
-  return 0
+  re="^${region}-(.+)-[a-z0-9]+-bucket\$"
+  [[ "${bucket}" =~ ${re} ]] || return 1
+  name_part="${BASH_REMATCH[1]}"
+  # Composer truncates long names: the name part must be this environment's
+  # full name, or a prefix of it at least 10 characters long.
+  [[ "${name_part}" == "${env_name}" ]] && return 0
+  ((${#name_part} >= 10)) && [[ "${env_name}" == "${name_part}"* ]]
 }
 
 # ── Option parsing (shared) ─────────────────────────────────────────────────
@@ -355,11 +358,12 @@ setting() {
 select_environments() {
   local key
   if ((${#OPT_ENVS[@]})); then
+    # Validate first (die must not run inside a pipeline sub-shell).
     for key in "${OPT_ENVS[@]}"; do
       jq -e --arg k "${key}" 'has($k)' "${RESOLVED_JSON}" >/dev/null ||
         die "environment '${key}' is not defined in ${CONFIG_REL} (known: $(jq -r 'keys | join(", ")' "${RESOLVED_JSON}"))"
-      printf '%s\n' "${key}"
-    done | awk '!seen[$0]++'
+    done
+    printf '%s\n' "${OPT_ENVS[@]}" | awk '!seen[$0]++'
   else
     jq -r 'to_entries[] | select(.value.hibernation.enabled == true) | .key' "${RESOLVED_JSON}"
   fi
@@ -648,6 +652,10 @@ list_creatable_image_versions() {
       error "could not list image versions for ${project}/${region}"
       return 1
     }
+    jq -e 'type == "object"' >/dev/null 2>&1 <<<"${out}" || {
+      error "unexpected (non-JSON) image version listing for ${project}/${region}"
+      return 1
+    }
     jq -r '.imageVersions[]? | select(.creationDisabled != true) | .imageVersionId' <<<"${out}"
     page="$(jq -r '.nextPageToken // empty' <<<"${out}")"
     [[ -n "${page}" ]] || break
@@ -679,17 +687,20 @@ restore_image_version() {
 
 # check_restorable KEY CURRENT_IMAGE — run BEFORE deleting an environment:
 # the environment must be re-creatable tomorrow on a version that can load
-# today's snapshot. Prints the reason and returns 1 otherwise.
-declare -A _CREATABLE_CACHE=()
+# today's snapshot. Returns 1 otherwise, with the reason in RESTORE_REASON.
+# Call it directly (not in $(...)) so the image-version cache is kept.
+declare -gA _CREATABLE_CACHE=()
+RESTORE_REASON=""
 check_restorable() {
   local key="$1" current="$2" restore project region cache_key list
+  RESTORE_REASON=""
   restore="$(restore_image_version "${key}" "${current}")"
   if [[ -z "${restore}" ]]; then
     warn "[${key}] restore will use GCP's default image (no image_version in YAML, pin_image_version: false); snapshot compatibility cannot be checked in advance"
     return 0
   fi
   if [[ -n "${current}" ]] && ! airflow_version_satisfies "$(airflow_version_of "${restore}")" "$(airflow_version_of "${current}")"; then
-    echo "restore image ${restore} (Airflow $(airflow_version_of "${restore}")) could not load a snapshot of the running ${current} — update software_config.image_version in the YAML first"
+    RESTORE_REASON="restore image ${restore} (Airflow $(airflow_version_of "${restore}")) could not load a snapshot of the running ${current} — update software_config.image_version in the YAML first"
     return 1
   fi
   if is_true "${HIBERNATE_SKIP_IMAGE_CHECK}"; then
@@ -701,13 +712,13 @@ check_restorable() {
   cache_key="${project}/${region}"
   if [[ -z "${_CREATABLE_CACHE[${cache_key}]:-}" ]]; then
     list="$(list_creatable_image_versions "${project}" "${region}")" || {
-      echo "could not verify that ${restore} is still creatable (set HIBERNATE_SKIP_IMAGE_CHECK=true to bypass)"
+      RESTORE_REASON="could not verify that ${restore} is still creatable (set HIBERNATE_SKIP_IMAGE_CHECK=true to bypass)"
       return 1
     }
     _CREATABLE_CACHE[${cache_key}]="${list:-<none>}"
   fi
   if ! image_version_creatable "${restore}" <<<"${_CREATABLE_CACHE[${cache_key}]}"; then
-    echo "image version ${restore} can no longer be used to create environments in ${region}; the environment could not be restored — set software_config.image_version to a supported version (same or later Airflow) first"
+    RESTORE_REASON="image version ${restore} can no longer be used to create environments in ${region}; the environment could not be restored — set software_config.image_version to a supported version (same or later Airflow) first"
     return 1
   fi
   info "[${key}] restore image ${restore} is creatable"

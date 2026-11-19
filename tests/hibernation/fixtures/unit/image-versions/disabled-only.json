@@ -1,0 +1,6 @@
+{
+  "imageVersions": [
+    {"imageVersionId": "composer-3-airflow-2.10.5-build.17", "creationDisabled": true},
+    {"imageVersionId": "composer-3-airflow-2.11.0-build.2", "creationDisabled": false}
+  ]
+}

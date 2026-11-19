@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# terraform test double for tests/hibernation/unit.bats (tf_init and
+# tf_state_list). Every call is appended to $STUB_DIR/terraform.calls.
+#   init        exits $STUB_TF_INIT_RC (default 0); unless STUB_TF_BACKEND is
+#               "none" (the default) it writes <data dir>/terraform.tfstate
+#               with backend.type = $STUB_TF_BACKEND, like real terraform does
+#               for a configured backend. The data dir is $TF_DATA_DIR
+#               (relative to -chdir) or <-chdir>/.terraform.
+#   state list  prints $STUB_DIR/state-list; exits $STUB_TF_STATE_RC (default 0)
+set -uo pipefail
+: "${STUB_DIR:?STUB_DIR must be set}"
+printf '%s\n' "$*" >>"${STUB_DIR}/terraform.calls"
+
+chdir="."
+args=()
+for a in "$@"; do
+  case "${a}" in
+  -chdir=*) chdir="${a#-chdir=}" ;;
+  *) args+=("${a}") ;;
+  esac
+done
+
+case "${args[0]:-}" in
+init)
+  if [[ "${STUB_TF_INIT_RC:-0}" != 0 ]]; then
+    echo "Error: Failed to get existing workspaces (stub)" >&2
+    exit "${STUB_TF_INIT_RC}"
+  fi
+  data="${TF_DATA_DIR:-.terraform}"
+  [[ "${data}" == /* ]] || data="${chdir}/${data}"
+  mkdir -p "${data}"
+  if [[ "${STUB_TF_BACKEND:-none}" != none ]]; then
+    jq -n --arg t "${STUB_TF_BACKEND}" \
+      '{version: 3, terraform_version: "1.17.2", backend: {type: $t, config: {}, hash: 1}}' \
+      >"${data}/terraform.tfstate"
+  fi
+  echo "Terraform has been successfully initialized!"
+  ;;
+state)
+  [[ "${args[1]:-}" == list ]] || exit 97
+  if [[ "${STUB_TF_STATE_RC:-0}" != 0 ]]; then
+    echo "Error: Error acquiring the state lock (stub)" >&2
+    exit "${STUB_TF_STATE_RC}"
+  fi
+  cat "${STUB_DIR}/state-list" 2>/dev/null || true
+  ;;
+*)
+  printf 'stub terraform: unsupported command: %s\n' "$*" >&2
+  exit 97
+  ;;
+esac

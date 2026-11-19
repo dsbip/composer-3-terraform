@@ -1,0 +1,4 @@
+# Resolver fixture: `environments:` without a value (YAML null) is refused,
+# like terraform plan of the root module refuses it.
+project_id: "empty-project"
+environments:

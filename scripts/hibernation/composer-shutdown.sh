@@ -78,11 +78,11 @@ preflight() {
     fi
     # Never delete what cannot be brought back tomorrow: the restore image
     # must still be creatable and able to load the snapshot.
-    local current reason
+    local current
     current="$(describe_get "${key}" .config.softwareConfig.imageVersion)"
     [[ "${action}" == delete_only ]] && current="$(manifest_get "${key}" .latest_snapshot.image_version)"
-    if ! reason="$(check_restorable "${key}" "${current}")"; then
-      result_set "${key}" failed "not deleting: ${reason}"
+    if ! check_restorable "${key}" "${current}"; then
+      result_set "${key}" failed "not deleting: ${RESTORE_REASON}"
       return 0
     fi
     ;;

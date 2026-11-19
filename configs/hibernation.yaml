@@ -1,0 +1,128 @@
+# ============================================================================
+# Hibernation Configuration — Non-production environments that sleep
+# Every hibernation setting, with its default. Hibernating environments are
+# snapshotted + deleted outside working hours and recreated + restored from
+# the snapshot in the morning by scripts/hibernation/composer-shutdown.sh and
+# composer-startup.sh (scheduled by pipelines/composer-hibernation.yml).
+# Production environments can never hibernate. See docs/hibernation.md.
+#
+# Settings resolve like every other setting of the module:
+#   per-environment hibernation.<key>  →  global hibernation.<key>  →  default
+# merged field by field (an explicit null falls through to the next level).
+# ============================================================================
+
+project_id: "my-gcp-project"
+region: "europe-west2"
+
+labels:
+  managed_by: terraform
+  team: data-engineering
+
+# ── Global hibernation defaults (every value below IS the default) ─────────
+hibernation:
+  # Take part in hibernation. Opt in per environment; refused (plan fails)
+  # for production: env/environment/tier/stage label prod|production|prd, or
+  # without such a label a prod/production/prd token in the name.
+  enabled: false
+
+  # Bucket for snapshots and hibernation-state.json; one bucket can serve many
+  # environments and must differ from storage.bucket.
+  # null = "<project_id>-composer-snapshots" (here: my-gcp-project-composer-snapshots).
+  snapshot_bucket: null
+
+  # Location used when the scripts create the snapshot bucket.
+  # null = the environment's region.
+  snapshot_bucket_location: null
+
+  # Create the snapshot bucket when it is missing (false = it must exist).
+  create_snapshot_bucket: true
+
+  # Folder inside the bucket; snapshots go to <prefix>/<project>/<region>/<env-name>/.
+  snapshot_prefix: "composer-hibernation"
+
+  # Snapshots kept per environment (>= 1); the current restore point is never pruned.
+  snapshot_retention_count: 7
+
+  # Without software_config.image_version, recreate on the snapshot's Airflow version.
+  pin_image_version: true
+
+  # Delete the auto-created environment bucket a deletion leaves behind (never storage.bucket).
+  delete_orphaned_bucket: true
+
+  # Grace period in days before an orphaned bucket (and its task logs) is deleted; 0 = at once.
+  orphaned_bucket_retention_days: 7
+
+  # Flags for loading the snapshot into the recreated environment. Terraform has
+  # already applied the YAML's packages, env variables and Airflow overrides,
+  # so by default only the Airflow database and dags/, plugins/, data/ load.
+  load_options:
+    # Do not reinstall PyPI packages from the snapshot (Terraform installed them).
+    skip_pypi_packages_installation: true
+    # Do not restore environment variables from the snapshot (Terraform set them).
+    skip_environment_variables_setting: true
+    # Do not restore Airflow config overrides from the snapshot (Terraform set them).
+    skip_airflow_overrides_setting: true
+    # true = do not restore dags/, plugins/, data/ (e.g. a DAG deploy runs after startup).
+    skip_gcs_data_copying: false
+
+environments:
+
+  # ── Dev: hibernates with all defaults ────────────────────────────────────
+  composer-dev:
+    labels:
+      env: dev
+
+    software_config:
+      # Pinning an alias (composer-3-airflow-X.Y.Z = newest build of that
+      # Airflow version) is recommended for hibernating environments: every
+      # restore is then created on a known, still-creatable version instead of
+      # whatever GCP's default is that morning.
+      image_version: "composer-3-airflow-2.10.5"
+      env_variables:
+        ENVIRONMENT: "dev"
+
+    hibernation:
+      enabled: true
+
+  # ── QA: hibernates, with a persistent custom bucket ──────────────────────
+  composer-qa:
+    labels:
+      env: qa
+
+    network:
+      subnetwork_cidr: "10.10.0.0/24"
+      pods_cidr: "10.11.0.0/16"
+      services_cidr: "10.12.0.0/20"
+
+    # Recommended for environments that are deleted and recreated regularly:
+    # a pre-created bucket (same region, Standard class, no retention policy)
+    # survives every cycle, so dag_gcs_prefix, task logs and DAG deploy
+    # targets never change and no orphaned bucket is left behind. The
+    # environment's service account needs object admin on it.
+    storage:
+      bucket: "my-gcp-project-composer-qa"
+
+    # No software_config.image_version: pin_image_version recreates the
+    # environment on the Airflow version its snapshot was taken on.
+
+    hibernation:
+      enabled: true
+      snapshot_retention_count: 3   # per-env override; everything else from the global block
+
+  # ── Prod: never hibernates ───────────────────────────────────────────────
+  composer-prod:
+    environment_size: "ENVIRONMENT_SIZE_MEDIUM"
+
+    labels:
+      env: production
+
+    network:
+      subnetwork_cidr: "10.20.0.0/24"
+      pods_cidr: "10.21.0.0/16"
+      services_cidr: "10.22.0.0/20"
+
+    software_config:
+      image_version: "composer-3-airflow-2.10.5"
+
+    hibernation:
+      enabled: false   # must stay false: plan fails if enabled on production

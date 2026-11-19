@@ -1,0 +1,25 @@
+{
+  "imageVersions": [
+    {
+      "imageVersionId": "composer-3-airflow-2.10.5-build.17",
+      "isDefault": true,
+      "supportedPythonVersions": ["3.11"],
+      "releaseDate": {"year": 2026, "month": 10, "day": 2},
+      "creationDisabled": false,
+      "upgradeDisabled": false
+    },
+    {
+      "imageVersionId": "composer-3-airflow-2.9.3-build.30",
+      "supportedPythonVersions": ["3.11"],
+      "releaseDate": {"year": 2026, "month": 3, "day": 4},
+      "creationDisabled": true,
+      "upgradeDisabled": true
+    },
+    {
+      "imageVersionId": "composer-3-airflow-2.9.3-build.31",
+      "supportedPythonVersions": ["3.11"],
+      "releaseDate": {"year": 2026, "month": 4, "day": 1}
+    }
+  ],
+  "nextPageToken": "tok-page-2"
+}

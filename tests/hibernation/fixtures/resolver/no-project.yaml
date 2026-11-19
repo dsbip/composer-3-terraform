@@ -1,0 +1,7 @@
+# Resolver fixture: no project_id anywhere.
+environments:
+  composer-dev:
+    labels: { env: dev }
+    hibernation: { enabled: true }
+  composer-off:
+    labels: { env: dev }

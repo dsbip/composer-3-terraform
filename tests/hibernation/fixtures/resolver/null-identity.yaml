@@ -1,0 +1,13 @@
+# Resolver fixture: explicit per-environment nulls for identity fields must
+# fall through to the global value (per-env > global > default).
+project_id: "identity-project"
+region: "europe-west3"
+
+environments:
+  composer-null-region:
+    region: null
+    labels: { env: dev }
+  composer-null-project:
+    project_id: null
+    labels: { env: dev }
+    hibernation: { enabled: true }

@@ -1,0 +1,62 @@
+# Resolver fixture: global -> per-environment merge of every resolved field.
+project_id: "global-project"
+region: "europe-west1"
+
+labels:
+  managed_by: terraform
+  team: platform
+
+hibernation:
+  enabled: true
+  snapshot_bucket: "global-snapshots"
+  snapshot_prefix: "/global/prefix/"   # leading/trailing slashes are trimmed
+  snapshot_retention_count: 4
+  pin_image_version: false
+  orphaned_bucket_retention_days: 3
+  load_options:
+    skip_pypi_packages_installation: false
+    skip_gcs_data_copying: true
+
+environments:
+  # Inherits everything from the global settings.
+  composer-inherit:
+    labels:
+      env: dev
+
+  # Overrides identity and most hibernation fields; explicit nulls inside the
+  # hibernation block fall through to the global value.
+  composer-override:
+    environment_name: "composer-renamed"
+    project_id: "other-project"
+    region: "us-central1"
+    labels:
+      env: test
+      team: data                      # per-env label wins over the global one
+    storage:
+      bucket: "other-project-composer-data"
+    software_config:
+      image_version: "composer-3-airflow-2.9.3"
+    service_account:
+      name: "custom-sa"
+    hibernation:
+      enabled: null                   # -> global true
+      snapshot_bucket: null           # -> global "global-snapshots"
+      snapshot_bucket_location: "US"
+      create_snapshot_bucket: false
+      snapshot_prefix: "team-a"
+      snapshot_retention_count: 1
+      delete_orphaned_bucket: false
+      orphaned_bucket_retention_days: 0
+      load_options:
+        skip_gcs_data_copying: null   # -> global true
+        skip_airflow_overrides_setting: false
+
+  # Existing service account; hibernation switched off for this environment.
+  composer-existing-sa:
+    labels:
+      env: qa
+    service_account:
+      create: false
+      existing_email: "shared-composer@global-project.iam.gserviceaccount.com"
+    hibernation:
+      enabled: false

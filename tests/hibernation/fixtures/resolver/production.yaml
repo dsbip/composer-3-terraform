@@ -1,0 +1,50 @@
+# Resolver fixture: production detection. Hibernation stays disabled so no
+# environment has validation errors; only is_production is under test.
+project_id: "prod-detect-project"
+
+labels:
+  managed_by: terraform
+
+environments:
+  # ── By label (env / environment / tier / stage) ─────────────────────────
+  label-env-prod:
+    labels: { env: prod }
+  label-env-production:
+    labels: { env: production }
+  label-env-prd:
+    labels: { env: prd }
+  label-environment:
+    labels: { environment: production }
+  label-tier:
+    labels: { tier: prd }
+  label-stage-uppercase:
+    labels: { stage: Production }
+  label-any-of-several:
+    labels: { env: dev, tier: prod }
+  label-env-dev:
+    labels: { env: dev }
+  label-env-preprod:
+    labels: { env: preprod }
+  # Explicit labels win over the name.
+  composer-prod-replica:
+    labels: { env: test }
+  # Not one of the four label keys: the name decides.
+  composer-team-label:
+    labels: { team: production }
+
+  # ── By name (no env/environment/tier/stage label) ───────────────────────
+  composer-prod: {}
+  prod: {}
+  prod-composer: {}
+  composer-production: {}
+  composer-prd-2: {}
+  composer-preprod: {}
+  composer-product: {}
+  composer-prodx: {}
+  reproduction: {}
+
+  # ── By environment_name override ────────────────────────────────────────
+  composer-renamed-to-prod:
+    environment_name: "composer-prod-eu"
+  composer-prod-key:
+    environment_name: "composer-dev-eu"

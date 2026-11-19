@@ -1,0 +1,209 @@
+{
+  "composer-bad": {
+    "custom_bucket": null,
+    "environment_key": "composer-bad",
+    "environment_name": "composer-bad",
+    "hibernation": {
+      "create_snapshot_bucket": true,
+      "delete_orphaned_bucket": true,
+      "enabled": true,
+      "load_options": {
+        "skip_airflow_overrides_setting": true,
+        "skip_environment_variables_setting": true,
+        "skip_gcs_data_copying": false,
+        "skip_pypi_packages_installation": true
+      },
+      "orphaned_bucket_retention_days": 7,
+      "pin_image_version": true,
+      "snapshot_bucket": "hib-test-project-composer-snapshots",
+      "snapshot_bucket_location": "europe-west2",
+      "snapshot_location": "gs://hib-test-project-composer-snapshots/composer-hibernation/hib-test-project/europe-west2/composer-bad",
+      "snapshot_prefix": "composer-hibernation",
+      "snapshot_retention_count": 0,
+      "state_object": "gs://hib-test-project-composer-snapshots/composer-hibernation/hib-test-project/europe-west2/composer-bad/hibernation-state.json"
+    },
+    "image_version": null,
+    "is_production": false,
+    "labels": {
+      "env": "dev",
+      "managed_by": "terraform"
+    },
+    "project_id": "hib-test-project",
+    "region": "europe-west2",
+    "service_account_email": "composer-bad-sa@hib-test-project.iam.gserviceaccount.com",
+    "validation_errors": [
+      "hibernation.snapshot_retention_count must be a whole number >= 1",
+      "hibernation.load_options.skip_everything is not a supported option (allowed: skip_airflow_overrides_setting, skip_environment_variables_setting, skip_gcs_data_copying, skip_pypi_packages_installation)"
+    ]
+  },
+  "composer-dev": {
+    "custom_bucket": null,
+    "environment_key": "composer-dev",
+    "environment_name": "composer-dev",
+    "hibernation": {
+      "create_snapshot_bucket": true,
+      "delete_orphaned_bucket": true,
+      "enabled": true,
+      "load_options": {
+        "skip_airflow_overrides_setting": true,
+        "skip_environment_variables_setting": true,
+        "skip_gcs_data_copying": false,
+        "skip_pypi_packages_installation": true
+      },
+      "orphaned_bucket_retention_days": 7,
+      "pin_image_version": true,
+      "snapshot_bucket": "hib-test-project-composer-snapshots",
+      "snapshot_bucket_location": "europe-west2",
+      "snapshot_location": "gs://hib-test-project-composer-snapshots/composer-hibernation/hib-test-project/europe-west2/composer-dev",
+      "snapshot_prefix": "composer-hibernation",
+      "snapshot_retention_count": 2,
+      "state_object": "gs://hib-test-project-composer-snapshots/composer-hibernation/hib-test-project/europe-west2/composer-dev/hibernation-state.json"
+    },
+    "image_version": null,
+    "is_production": false,
+    "labels": {
+      "env": "dev",
+      "managed_by": "terraform"
+    },
+    "project_id": "hib-test-project",
+    "region": "europe-west2",
+    "service_account_email": "composer-dev-sa@hib-test-project.iam.gserviceaccount.com",
+    "validation_errors": []
+  },
+  "composer-nopin": {
+    "custom_bucket": null,
+    "environment_key": "composer-nopin",
+    "environment_name": "composer-nopin",
+    "hibernation": {
+      "create_snapshot_bucket": false,
+      "delete_orphaned_bucket": true,
+      "enabled": true,
+      "load_options": {
+        "skip_airflow_overrides_setting": true,
+        "skip_environment_variables_setting": true,
+        "skip_gcs_data_copying": true,
+        "skip_pypi_packages_installation": false
+      },
+      "orphaned_bucket_retention_days": 7,
+      "pin_image_version": false,
+      "snapshot_bucket": "other-project-composer-snapshots",
+      "snapshot_bucket_location": "us-central1",
+      "snapshot_location": "gs://other-project-composer-snapshots/composer-hibernation/other-project/us-central1/composer-nopin",
+      "snapshot_prefix": "composer-hibernation",
+      "snapshot_retention_count": 2,
+      "state_object": "gs://other-project-composer-snapshots/composer-hibernation/other-project/us-central1/composer-nopin/hibernation-state.json"
+    },
+    "image_version": null,
+    "is_production": false,
+    "labels": {
+      "env": "qa",
+      "managed_by": "terraform"
+    },
+    "project_id": "other-project",
+    "region": "us-central1",
+    "service_account_email": "composer-nopin-sa@other-project.iam.gserviceaccount.com",
+    "validation_errors": []
+  },
+  "composer-off": {
+    "custom_bucket": null,
+    "environment_key": "composer-off",
+    "environment_name": "composer-off",
+    "hibernation": {
+      "create_snapshot_bucket": true,
+      "delete_orphaned_bucket": true,
+      "enabled": false,
+      "load_options": {
+        "skip_airflow_overrides_setting": true,
+        "skip_environment_variables_setting": true,
+        "skip_gcs_data_copying": false,
+        "skip_pypi_packages_installation": true
+      },
+      "orphaned_bucket_retention_days": 7,
+      "pin_image_version": true,
+      "snapshot_bucket": "hib-test-project-composer-snapshots",
+      "snapshot_bucket_location": "europe-west2",
+      "snapshot_location": "gs://hib-test-project-composer-snapshots/composer-hibernation/hib-test-project/europe-west2/composer-off",
+      "snapshot_prefix": "composer-hibernation",
+      "snapshot_retention_count": 2,
+      "state_object": "gs://hib-test-project-composer-snapshots/composer-hibernation/hib-test-project/europe-west2/composer-off/hibernation-state.json"
+    },
+    "image_version": null,
+    "is_production": false,
+    "labels": {
+      "env": "dev",
+      "managed_by": "terraform"
+    },
+    "project_id": "hib-test-project",
+    "region": "europe-west2",
+    "service_account_email": "composer-off-sa@hib-test-project.iam.gserviceaccount.com",
+    "validation_errors": []
+  },
+  "composer-prod": {
+    "custom_bucket": null,
+    "environment_key": "composer-prod",
+    "environment_name": "composer-prod",
+    "hibernation": {
+      "create_snapshot_bucket": true,
+      "delete_orphaned_bucket": true,
+      "enabled": false,
+      "load_options": {
+        "skip_airflow_overrides_setting": true,
+        "skip_environment_variables_setting": true,
+        "skip_gcs_data_copying": false,
+        "skip_pypi_packages_installation": true
+      },
+      "orphaned_bucket_retention_days": 7,
+      "pin_image_version": true,
+      "snapshot_bucket": "hib-test-project-composer-snapshots",
+      "snapshot_bucket_location": "europe-west2",
+      "snapshot_location": "gs://hib-test-project-composer-snapshots/composer-hibernation/hib-test-project/europe-west2/composer-prod",
+      "snapshot_prefix": "composer-hibernation",
+      "snapshot_retention_count": 2,
+      "state_object": "gs://hib-test-project-composer-snapshots/composer-hibernation/hib-test-project/europe-west2/composer-prod/hibernation-state.json"
+    },
+    "image_version": null,
+    "is_production": true,
+    "labels": {
+      "env": "production",
+      "managed_by": "terraform"
+    },
+    "project_id": "hib-test-project",
+    "region": "europe-west2",
+    "service_account_email": "composer-prod-sa@hib-test-project.iam.gserviceaccount.com",
+    "validation_errors": []
+  },
+  "composer-test": {
+    "custom_bucket": "hib-test-project-composer-test-data",
+    "environment_key": "composer-test",
+    "environment_name": "composer-test",
+    "hibernation": {
+      "create_snapshot_bucket": true,
+      "delete_orphaned_bucket": true,
+      "enabled": true,
+      "load_options": {
+        "skip_airflow_overrides_setting": true,
+        "skip_environment_variables_setting": true,
+        "skip_gcs_data_copying": false,
+        "skip_pypi_packages_installation": true
+      },
+      "orphaned_bucket_retention_days": 7,
+      "pin_image_version": true,
+      "snapshot_bucket": "hib-test-project-composer-snapshots",
+      "snapshot_bucket_location": "europe-west2",
+      "snapshot_location": "gs://hib-test-project-composer-snapshots/composer-hibernation/hib-test-project/europe-west2/composer-test",
+      "snapshot_prefix": "composer-hibernation",
+      "snapshot_retention_count": 2,
+      "state_object": "gs://hib-test-project-composer-snapshots/composer-hibernation/hib-test-project/europe-west2/composer-test/hibernation-state.json"
+    },
+    "image_version": "composer-3-airflow-2.9.3",
+    "is_production": false,
+    "labels": {
+      "env": "test",
+      "managed_by": "terraform"
+    },
+    "project_id": "hib-test-project",
+    "region": "europe-west2",
+    "service_account_email": "composer-test-sa@hib-test-project.iam.gserviceaccount.com",
+    "validation_errors": []
+  }
+}

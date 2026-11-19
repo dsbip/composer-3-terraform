@@ -1,0 +1,65 @@
+# Resolver fixture: one invalid hibernation setting per environment. The
+# resolver still succeeds; the errors are reported in validation_errors
+# (the module turns them into a plan-time precondition failure).
+project_id: "invalid-project"
+
+environments:
+  bad-enabled:
+    labels: { env: dev }
+    hibernation: { enabled: "maybe" }
+  bad-create-bucket:
+    labels: { env: dev }
+    hibernation: { enabled: true, create_snapshot_bucket: "nope" }
+  bad-pin-image:
+    labels: { env: dev }
+    hibernation: { enabled: true, pin_image_version: 3 }
+  bad-delete-bucket:
+    labels: { env: dev }
+    hibernation: { enabled: true, delete_orphaned_bucket: "sometimes" }
+  bad-retention-zero:
+    labels: { env: dev }
+    hibernation: { enabled: true, snapshot_retention_count: 0 }
+  bad-retention-fraction:
+    labels: { env: dev }
+    hibernation: { enabled: true, snapshot_retention_count: 2.5 }
+  bad-orphan-days:
+    labels: { env: dev }
+    hibernation: { enabled: true, orphaned_bucket_retention_days: -1 }
+  bad-load-option-key:
+    labels: { env: dev }
+    hibernation:
+      enabled: true
+      load_options: { skip_everything: true }
+  bad-load-option-value:
+    labels: { env: dev }
+    hibernation:
+      enabled: true
+      load_options: { skip_gcs_data_copying: "sometimes" }
+  bad-bucket-name:
+    labels: { env: dev }
+    hibernation: { enabled: true, snapshot_bucket: "Bad_Bucket!" }
+  bad-bucket-dots:
+    labels: { env: dev }
+    hibernation: { enabled: true, snapshot_bucket: "my.dotted.bucket" }
+  bad-prefix:
+    labels: { env: dev }
+    hibernation: { enabled: true, snapshot_prefix: "two words" }
+  bucket-equals-storage:
+    labels: { env: dev }
+    storage: { bucket: "invalid-project-shared" }
+    hibernation: { enabled: true, snapshot_bucket: "invalid-project-shared" }
+  not-a-map:
+    labels: { env: dev }
+    hibernation: "yes"
+  prod-by-label:
+    labels: { env: production }
+    hibernation: { enabled: true }
+  composer-prod:
+    hibernation: { enabled: true }
+  two-errors:
+    labels: { env: dev }
+    hibernation: { enabled: true, snapshot_retention_count: 0, orphaned_bucket_retention_days: -1 }
+  # Bucket/prefix/production checks only apply when hibernation is enabled.
+  disabled-bad-bucket:
+    labels: { env: production }
+    hibernation: { enabled: false, snapshot_bucket: "Bad_Bucket!" }

@@ -1,0 +1,29 @@
+# Resolver fixture: YAML 1.1 booleans, quoted values and empty environments.
+project_id: "quirks-project"
+
+labels:
+  env: dev
+
+environments:
+  yes-unquoted:
+    hibernation: { enabled: yes }
+  on-unquoted:
+    hibernation: { enabled: on }
+  true-capitalised:
+    hibernation: { enabled: True }
+  true-quoted:
+    hibernation: { enabled: "true" }
+  false-quoted:
+    hibernation: { enabled: "false" }
+  no-unquoted:
+    hibernation: { enabled: no }
+  # A string, not a boolean -> rejected.
+  yes-quoted:
+    hibernation: { enabled: "yes" }
+  count-quoted:
+    hibernation: { enabled: true, snapshot_retention_count: "3" }
+  # Value-less environment (YAML null) and an empty mapping both resolve.
+  null-env:
+  empty-env: {}
+  null-hibernation:
+    hibernation:

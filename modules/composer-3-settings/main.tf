@@ -15,9 +15,10 @@
 
 locals {
   # ── Identity ─────────────────────────────────────────────────────────
-  environment_name = try(var.config.environment_name, var.environment_key)
-  project_id       = try(var.config.project_id, var.global_config.project_id)
-  region           = try(var.config.region, try(var.global_config.region, "europe-west2"))
+  # per-env > global > default; an explicit YAML null falls through too.
+  environment_name = coalesce(try(var.config.environment_name, null), var.environment_key)
+  project_id       = try(coalesce(try(var.config.project_id, null), try(var.global_config.project_id, null)), null)
+  region           = coalesce(try(var.config.region, null), try(var.global_config.region, null), "europe-west2")
 
   # ── Labels (global merged with per-env; per-env wins) ───────────────
   global_labels = try(var.global_config.labels, {})
@@ -64,9 +65,18 @@ locals {
   global_hibernation_is_map = local.global_hibernation_raw == null || can(keys(local.global_hibernation_raw))
   env_hibernation_is_map    = local.env_hibernation_raw == null || can(keys(local.env_hibernation_raw))
 
-  global_hibernation = try({ for k, v in local.global_hibernation_raw : k => v if v != null }, {})
-  env_hibernation    = try({ for k, v in local.env_hibernation_raw : k => v if v != null }, {})
+  # (a list is iterable too, so only build these from real maps)
+  global_hibernation = try({ for k, v in local.global_hibernation_raw : k => v if v != null && local.global_hibernation_is_map }, {})
+  env_hibernation    = try({ for k, v in local.env_hibernation_raw : k => v if v != null && local.env_hibernation_is_map }, {})
   hibernation_merged = merge(local.global_hibernation, local.env_hibernation)
+
+  supported_hibernation_keys = [
+    "enabled", "snapshot_bucket", "snapshot_bucket_location", "create_snapshot_bucket", "snapshot_prefix",
+    "snapshot_retention_count", "pin_image_version", "delete_orphaned_bucket", "orphaned_bucket_retention_days",
+    "load_options",
+  ]
+  global_load_options_is_map = try(local.global_hibernation.load_options, null) == null || can(keys(local.global_hibernation.load_options))
+  env_load_options_is_map    = try(local.env_hibernation.load_options, null) == null || can(keys(local.env_hibernation.load_options))
 
   # Raw (unvalidated) values — validated below, normalised in `hibernation`.
   raw_enabled                = try(local.hibernation_merged.enabled, false)
@@ -152,6 +162,20 @@ locals {
         can(tonumber(local.raw_orphan_retention_days)) && try(tonumber(local.raw_orphan_retention_days) >= 0 && floor(tonumber(local.raw_orphan_retention_days)) == tonumber(local.raw_orphan_retention_days), false)
         ? "" : "hibernation.orphaned_bucket_retention_days must be a whole number >= 0"
       ),
+    ],
+    [
+      for k in keys(local.global_hibernation) :
+      "global hibernation.${k} is not a supported setting (allowed: ${join(", ", local.supported_hibernation_keys)})"
+      if !contains(local.supported_hibernation_keys, k)
+    ],
+    [
+      for k in keys(local.env_hibernation) :
+      "hibernation.${k} is not a supported setting (allowed: ${join(", ", local.supported_hibernation_keys)})"
+      if !contains(local.supported_hibernation_keys, k)
+    ],
+    [
+      local.global_load_options_is_map ? "" : "global hibernation.load_options must be a map of true/false flags",
+      local.env_load_options_is_map ? "" : "hibernation.load_options must be a map of true/false flags",
     ],
     [
       for k in keys(local.raw_load_options) :

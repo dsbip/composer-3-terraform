@@ -1,0 +1,9 @@
+# Resolver fixture: the global hibernation block must be a map.
+project_id: "global-not-a-map-project"
+
+hibernation:
+  - enabled
+
+environments:
+  composer-dev:
+    labels: { env: dev }

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# curl test double for tests/hibernation/unit.bats: serves Composer
+# imageVersions pages from $STUB_DIR/pages/<pageToken>.json (first.json for
+# the first page). For call n it records
+#   $STUB_DIR/curl.<n>.argv   the arguments, one per line
+#   $STUB_DIR/curl.<n>.stdin  the curl config read from stdin (-K -)
+# and appends the URL to $STUB_DIR/curl.urls. The request is rejected (401)
+# unless the bearer token arrives through that stdin config; the presence of
+# $STUB_DIR/curl-fail makes every call fail like an HTTP 503.
+set -uo pipefail
+: "${STUB_DIR:?STUB_DIR must be set}"
+n=$(($(cat "${STUB_DIR}/curl.count" 2>/dev/null || echo 0) + 1))
+printf '%s\n' "${n}" >"${STUB_DIR}/curl.count"
+printf '%s\n' "$@" >"${STUB_DIR}/curl.${n}.argv"
+
+config="" prev="" url=""
+for a in "$@"; do
+  if [[ "${prev}" == -K && "${a}" == - ]]; then
+    config="$(cat)"
+  fi
+  [[ "${a}" != http* ]] || url="${a}"
+  prev="${a}"
+done
+printf '%s\n' "${config}" >"${STUB_DIR}/curl.${n}.stdin"
+printf '%s\n' "${url}" >>"${STUB_DIR}/curl.urls"
+
+if [[ -f "${STUB_DIR}/curl-fail" ]]; then
+  echo "curl: (22) The requested URL returned error: 503" >&2
+  exit 22
+fi
+if [[ "${config}" != *'header = "Authorization: Bearer '* ]]; then
+  echo "curl: (22) The requested URL returned error: 401" >&2
+  exit 22
+fi
+re='[?&]pageToken=([^&]+)'
+token="first"
+if [[ "${url}" =~ ${re} ]]; then
+  token="${BASH_REMATCH[1]}"
+fi
+page="${STUB_DIR}/pages/${token}.json"
+if [[ ! -f "${page}" ]]; then
+  echo "curl: (22) The requested URL returned error: 404" >&2
+  exit 22
+fi
+cat "${page}"

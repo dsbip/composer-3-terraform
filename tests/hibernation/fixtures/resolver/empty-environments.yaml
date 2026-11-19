@@ -1,0 +1,3 @@
+# Resolver fixture: an empty environments map resolves to {}.
+project_id: "empty-project"
+environments: {}

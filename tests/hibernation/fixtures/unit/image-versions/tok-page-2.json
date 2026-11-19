@@ -1,0 +1,16 @@
+{
+  "imageVersions": [
+    {
+      "imageVersionId": "composer-3-airflow-3.0.1-build.3",
+      "supportedPythonVersions": ["3.11"],
+      "releaseDate": {"year": 2026, "month": 9, "day": 15},
+      "creationDisabled": false
+    },
+    {
+      "imageVersionId": "composer-3-airflow-2.10.4-build.9",
+      "supportedPythonVersions": ["3.11"],
+      "releaseDate": {"year": 2026, "month": 1, "day": 20},
+      "creationDisabled": true
+    }
+  ]
+}

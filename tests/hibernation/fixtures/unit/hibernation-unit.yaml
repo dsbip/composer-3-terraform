@@ -1,0 +1,72 @@
+# Unit-test fixture for tests/hibernation/unit.bats.
+#
+# resolved.json next to this file is the output of the offline settings
+# resolver (scripts/hibernation/resolver) for this YAML; unit.bats checks that
+# the two never drift apart. Regenerate with:
+#   tmp=$(mktemp -d)
+#   TF_DATA_DIR=$tmp terraform -chdir=scripts/hibernation/resolver init -backend-config=path=$tmp/r.tfstate
+#   TF_DATA_DIR=$tmp terraform -chdir=scripts/hibernation/resolver apply -auto-approve \
+#     -var config_file=$PWD/tests/hibernation/fixtures/unit/hibernation-unit.yaml
+#   TF_DATA_DIR=$tmp terraform -chdir=scripts/hibernation/resolver output -json environments \
+#     | jq -S . > tests/hibernation/fixtures/unit/resolved.json
+project_id: "hib-test-project"
+region: "europe-west2"
+
+labels:
+  managed_by: terraform
+
+hibernation:
+  enabled: true
+  snapshot_retention_count: 2
+
+environments:
+  # All defaults (pin_image_version: true, no image_version).
+  composer-dev:
+    labels:
+      env: dev
+
+  # Image version pinned in the YAML + custom bucket.
+  composer-test:
+    labels:
+      env: test
+    storage:
+      bucket: "hib-test-project-composer-test-data"
+    software_config:
+      image_version: "composer-3-airflow-2.9.3"
+
+  # Production: never hibernated.
+  composer-prod:
+    labels:
+      env: production
+    hibernation:
+      enabled: false
+
+  # Non-default booleans (false values must survive setting()), other
+  # project/region, no image pin.
+  composer-nopin:
+    project_id: "other-project"
+    region: "us-central1"
+    labels:
+      env: qa
+    hibernation:
+      pin_image_version: false
+      create_snapshot_bucket: false
+      load_options:
+        skip_gcs_data_copying: true
+        skip_pypi_packages_installation: false
+
+  # Hibernation switched off for this one environment.
+  composer-off:
+    labels:
+      env: dev
+    hibernation:
+      enabled: false
+
+  # Enabled but invalid: selected by default, rejected by the eligibility check.
+  composer-bad:
+    labels:
+      env: dev
+    hibernation:
+      snapshot_retention_count: 0
+      load_options:
+        skip_everything: true

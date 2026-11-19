@@ -1,0 +1,4 @@
+# Resolver fixture: no environments key at all resolves to {}.
+project_id: "empty-project"
+hibernation:
+  enabled: true

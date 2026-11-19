@@ -1,0 +1,22 @@
+# Resolver fixture: module defaults (no region, no global hibernation block).
+project_id: "defaults-project"
+
+environments:
+  composer-plain: {}
+
+  # The default snapshot bucket, its location and the snapshot path follow
+  # the per-environment project and region.
+  composer-elsewhere:
+    project_id: "elsewhere-project"
+    region: "us-east1"
+    hibernation:
+      enabled: true
+
+  # The SA name and snapshot path follow environment_name, not the key.
+  composer-key:
+    environment_name: "composer-display-name"
+
+  # create: false without existing_email -> no service account email.
+  composer-no-sa:
+    service_account:
+      create: false

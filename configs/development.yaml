@@ -36,3 +36,15 @@ environments:
         retention_days: 14
       task_logs_retention_config:
         storage_mode: "CLOUD_LOGGING_ONLY"
+
+    # ── Hibernation ────────────────────────────────────────────────────
+    # Snapshot + delete this environment outside working hours and recreate +
+    # restore it in the morning (scripts/hibernation/composer-shutdown.sh and
+    # composer-startup.sh, scheduled by pipelines/composer-hibernation.yml).
+    # Allowed because this is not production (env: development). Every other
+    # setting keeps its default: snapshots in gs://<project_id>-composer-snapshots,
+    # 7 kept, image version pinned to the snapshot's Airflow version.
+    # All settings are documented in configs/hibernation.yaml and
+    # docs/hibernation.md.
+    hibernation:
+      enabled: true

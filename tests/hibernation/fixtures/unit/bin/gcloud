@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Scripted gcloud test double for tests/hibernation/unit.bats.
+#
+# Every call is appended to $STUB_DIR/gcloud.calls ("$*", one line per call).
+#
+# Composer / auth calls are answered from scripted replies, per call number:
+#   $STUB_DIR/replies/<key>.<n>/{rc,stdout,stderr}   reply to the n-th call
+#   $STUB_DIR/replies/<key>/{rc,stdout,stderr}       reply to every other call
+# with <key> one of: describe, save, load, operation, token, iam.
+# The number of calls per key is kept in $STUB_DIR/<key>.count.
+#
+# Cloud Storage is emulated on disk: gs://<bucket>/<object> lives at
+# $STUB_DIR/gcs/<bucket>/<object> (a bucket exists when its directory does).
+# A scripted reply for storage-<verb> (cat, cp, ls, describe, rm) overrides
+# the emulation, e.g. to simulate PERMISSION_DENIED.
+set -uo pipefail
+: "${STUB_DIR:?STUB_DIR must be set}"
+printf '%s\n' "$*" >>"${STUB_DIR}/gcloud.calls"
+
+reply() {
+  local key="$1" n dir
+  n=$(($(cat "${STUB_DIR}/${key}.count" 2>/dev/null || echo 0) + 1))
+  printf '%s\n' "${n}" >"${STUB_DIR}/${key}.count"
+  dir="${STUB_DIR}/replies/${key}.${n}"
+  [[ -d "${dir}" ]] || dir="${STUB_DIR}/replies/${key}"
+  if [[ ! -d "${dir}" ]]; then
+    printf 'stub gcloud: no reply scripted for %s (call %s)\n' "${key}" "${n}" >&2
+    exit 97
+  fi
+  [[ ! -f "${dir}/stdout" ]] || cat "${dir}/stdout"
+  [[ ! -f "${dir}/stderr" ]] || cat "${dir}/stderr" >&2
+  exit "$(cat "${dir}/rc" 2>/dev/null || echo 0)"
+}
+
+scripted() { [[ -d "${STUB_DIR}/replies/$1" || -d "${STUB_DIR}/replies/$1.1" ]]; }
+
+# gs://bucket/path -> local path
+local_path() { printf '%s/gcs/%s\n' "${STUB_DIR}" "${1#gs://}"; }
+
+storage_ls() {
+  local url="$1" path entry found=false
+  path="$(local_path "${url}")"
+  if [[ "${url}" == */ ]]; then
+    if [[ -d "${path}" ]]; then
+      for entry in "${path}"*; do
+        [[ -e "${entry}" ]] || continue
+        found=true
+        if [[ -d "${entry}" ]]; then
+          printf '%s%s/\n' "${url}" "${entry##*/}"
+        else
+          printf '%s%s\n' "${url}" "${entry##*/}"
+        fi
+      done
+    fi
+  else
+    while IFS= read -r entry; do
+      [[ -n "${entry}" ]] || continue
+      found=true
+      printf 'gs://%s\n' "${entry#"${STUB_DIR}/gcs/"}"
+    done < <(compgen -G "${path}" || true)
+  fi
+  if [[ "${found}" != true ]]; then
+    echo "ERROR: (gcloud.storage.ls) One or more URLs matched no objects." >&2
+    exit 1
+  fi
+}
+
+case "${1:-} ${2:-} ${3:-}" in
+"composer environments describe") reply describe ;;
+"composer environments snapshots")
+  case "${4:-}" in
+  save) reply save ;;
+  load) reply load ;;
+  *) exit 97 ;;
+  esac
+  ;;
+"composer operations describe") reply operation ;;
+"auth print-access-token"*) reply token ;;
+"storage cat "*)
+  scripted storage-cat && reply storage-cat
+  obj="$(local_path "$3")"
+  if [[ -f "${obj}" ]]; then
+    cat "${obj}"
+  else
+    printf 'ERROR: (gcloud.storage.cat) The following URLs matched no objects or files:\n-%s\n' "$3" >&2
+    exit 1
+  fi
+  ;;
+"storage cp "*)
+  scripted storage-cp && reply storage-cp
+  obj="$(local_path "$4")"
+  mkdir -p "$(dirname "${obj}")"
+  cp "$3" "${obj}"
+  ;;
+"storage ls "*)
+  scripted storage-ls && reply storage-ls
+  storage_ls "$3"
+  ;;
+"storage rm "*)
+  scripted storage-rm && reply storage-rm
+  ;;
+"storage buckets describe")
+  scripted storage-describe && reply storage-describe
+  if [[ -d "$(local_path "$4")" ]]; then
+    printf '{"name": "%s"}\n' "${4#gs://}"
+  else
+    printf 'ERROR: (gcloud.storage.buckets.describe) %s not found: 404.\n' "$4" >&2
+    exit 1
+  fi
+  ;;
+"storage buckets create") mkdir -p "$(local_path "$4")" ;;
+"storage buckets add-iam-policy-binding") reply iam ;;
+*)
+  printf 'stub gcloud: unsupported command: %s\n' "$*" >&2
+  exit 97
+  ;;
+esac
