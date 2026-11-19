@@ -1834,7 +1834,7 @@ LOAD_DONE='{"name": "projects/hib-test-project/locations/europe-west2/operations
   run ensure_snapshot_bucket composer-dev "${sa}"
   assert_status 0
   assert_eq "$(t_calls "storage buckets create gs://hib-test-project-composer-snapshots --project=hib-test-project --location=europe-west2 --uniform-bucket-level-access --public-access-prevention")" 1
-  assert_eq "$(t_calls "storage buckets add-iam-policy-binding gs://hib-test-project-composer-snapshots --member=serviceAccount:${sa} --role=roles/storage.objectAdmin")" 1
+  assert_eq "$(t_calls "storage buckets add-iam-policy-binding gs://hib-test-project-composer-snapshots --member=serviceAccount:${sa} --role=roles/storage.objectAdmin --condition=None")" 1
 
   # Existing bucket: no create, grant again; no service account: no grant.
   run ensure_snapshot_bucket composer-dev "${sa}"
@@ -2138,21 +2138,110 @@ TABLE
   fi
 }
 
-@test "env_is_fresh / env_recreated_since_snapshot read the describe output and the newest snapshot" {
+@test "env_is_fresh / env_recreated_since_snapshot read the describe output and the restore point" {
   local f="${OPT_WORK_DIR}/state/composer-dev-describe.json"
   manifest_new composer-dev >"$(manifest_local_path composer-dev)"
   jq -n --arg t "$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%S.123456Z)" '{uuid: "u-2", createTime: $t}' >"${f}"
   env_is_fresh composer-dev
   HIBERNATE_FRESH_ENV_HOURS=1
   ! env_is_fresh composer-dev
+  local rc
   jq '.createTime = "not-a-date"' "${f}" >"${f}.t" && mv "${f}.t" "${f}"
-  env_is_fresh composer-dev # unknown creation time counts as fresh
+  env_is_fresh composer-dev 2>/dev/null && rc=0 || rc=$?
+  assert_eq "${rc}" 2 "unknown age is reported, not guessed"
+  jq 'del(.createTime)' "${f}" >"${f}.t" && mv "${f}.t" "${f}"
+  env_is_fresh composer-dev 2>/dev/null && rc=0 || rc=$?
+  assert_eq "${rc}" 2 "missing createTime"
 
-  ! env_recreated_since_snapshot composer-dev # no snapshot uuid recorded
-  manifest_update composer-dev '.snapshots = [{path: "gs://b/s1", environment_uuid: "u-1"}]'
+  ! env_recreated_since_snapshot composer-dev # no uuid recorded, no keep flag
+  manifest_update composer-dev '.latest_snapshot = {path: "gs://b/s1", environment_uuid: "u-1"} | .snapshots = [.latest_snapshot]'
   env_recreated_since_snapshot composer-dev
-  manifest_update composer-dev '.snapshots[0].environment_uuid = "u-2"'
+  manifest_update composer-dev '.latest_snapshot.environment_uuid = "u-2"'
   ! env_recreated_since_snapshot composer-dev
+  # After a "keep" the newest entry is a secondary of THIS environment: the
+  # comparison must still be with the restore point.
+  manifest_update composer-dev '.latest_snapshot.environment_uuid = "u-1"
+    | .snapshots = [{path: "gs://b/s2", environment_uuid: "u-2", restore_incomplete: true}, .latest_snapshot]'
+  env_recreated_since_snapshot composer-dev
+  # State files from before uuids were recorded: the keep flag decides.
+  manifest_update composer-dev 'del(.latest_snapshot.environment_uuid) | .snapshots[0] |= del(.environment_uuid)'
+  env_recreated_since_snapshot composer-dev
+  manifest_update composer-dev '.snapshots[0].restore_incomplete = false'
+  ! env_recreated_since_snapshot composer-dev
+}
+
+@test "rfc3339_epoch: Composer timestamps parse without GNU date" {
+  assert_eq "$(rfc3339_epoch 2026-11-19T07:00:12.345678Z)" 1795071612
+  assert_eq "$(rfc3339_epoch 2026-11-19T07:00:12.123456789Z)" 1795071612
+  assert_eq "$(rfc3339_epoch 2026-11-19T07:00:12Z)" 1795071612
+  assert_eq "$(rfc3339_epoch 2026-11-19T07:00:12.5+00:00)" 1795071612
+  assert_eq "$(rfc3339_epoch bogus)" ""
+  assert_eq "$(rfc3339_epoch "")" ""
+  # Without date on PATH (e.g. a BusyBox-only image, where date -d fails).
+  assert_eq "$(PATH="$(dirname "$(command -v jq)")" rfc3339_epoch 2026-11-19T07:00:12.345678Z)" 1795071612
+}
+
+@test "decide_startup_action: ERROR environments are replaced only when that loses nothing" {
+  local st snap rec fresh want got failures=() n=0
+  while read -r st snap rec fresh want; do
+    [[ -n "${st}" && "${st}" != \#* ]] || continue
+    n=$((n + 1))
+    got="$(decide_startup_action ERROR "${st}" "${snap}" "${rec}" "${fresh}" false)"
+    check_decision "${got}" "${want}" || failures+=("ERROR ${st} snap=${snap} recreated=${rec} fresh=${fresh}: got '${got}', want '${want}'")
+  done <<'TABLE'
+# STATUS        SNAP  RECREATED FRESH EXPECTED
+  RESTORING      true  false     true  replace_and_load
+  RESTORING      true  false     false refuse_stale
+  HIBERNATED     true  false     true  replace_and_load
+  HIBERNATED     true  true      false refuse_stale
+  SNAPSHOT_SAVED true  false     false replace_and_load
+  SNAPSHOT_SAVED true  true      true  replace_and_load
+  SNAPSHOT_SAVED true  true      false refuse_stale
+  HIBERNATED     false true      false error:no snapshot to restore
+  ACTIVE         true  true      true  error:outside a hibernation cycle
+TABLE
+  assert_eq "${n}" 9 "rows"
+  if ((${#failures[@]})); then
+    printf '%s\n' "${failures[@]}" >&2
+    return 1
+  fi
+}
+
+@test "restore_attempt_state: an unreadable operation is UNKNOWN, an expired one NONE" {
+  manifest_new composer-dev >"$(manifest_local_path composer-dev)"
+  echo '{"uuid": "u-1"}' >"${OPT_WORK_DIR}/state/composer-dev-describe.json"
+  manifest_update composer-dev '.latest_snapshot = {path: "gs://b/s1"}
+    | .restore_attempt = {operation: "projects/p/locations/r/operations/op-load-1", snapshot: "gs://b/s1", environment_uuid: "u-1"}'
+  t_reply operation 1 "" "ERROR: (gcloud.composer.operations.describe) UNAVAILABLE: try again"
+  assert_eq "$(restore_attempt_state composer-dev 2>/dev/null)" UNKNOWN
+  rm -rf "${STUB_DIR}/replies/operation"
+  t_reply operation 1 "" "ERROR: (gcloud.composer.operations.describe) NOT_FOUND: operation op-load-1 not found"
+  assert_eq "$(restore_attempt_state composer-dev 2>/dev/null)" NONE
+}
+
+@test "parse_common_args: recovery flags can come from HIBERNATE_* variables, each for its own script" {
+  HIBERNATE_SKIP_LOAD=true HIBERNATE_ALLOW_INITIAL_CREATE=yes HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT=true \
+    run bash "${UNIT}/parse-args.sh" startup -c x.yaml
+  assert_status 0
+  assert_contains "${output}" "skip_load=true"
+  assert_contains "${output}" "allow_initial_create=true"
+  assert_contains "${output}" "force_no_snapshot=false"
+  HIBERNATE_FORCE_LOAD=1 HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT=true run bash "${UNIT}/parse-args.sh" shutdown -c x.yaml
+  assert_status 0
+  assert_contains "${output}" "force_no_snapshot=true"
+  assert_contains "${output}" "force_load=false"
+  HIBERNATE_FORCE_LOAD=true HIBERNATE_SKIP_LOAD=true run bash "${UNIT}/parse-args.sh" startup -c x.yaml
+  assert_status 2
+}
+
+@test "manifest_transition: ACTIVE clears a pending operator decision" {
+  manifest_new composer-dev >"$(manifest_local_path composer-dev)"
+  OPT_DRY_RUN=true
+  manifest_update composer-dev '.awaiting_decision = {reason: "r", since: "t"}'
+  manifest_transition composer-dev RESTORING "x" 2>/dev/null
+  assert_eq "$(manifest_get composer-dev .awaiting_decision.reason)" r
+  manifest_transition composer-dev ACTIVE "y" 2>/dev/null
+  assert_eq "$(manifest_get composer-dev .awaiting_decision)" ""
 }
 
 @test "restore_attempt_state: SUCCEEDED / FAILED / RUNNING only for the described environment and restore point" {

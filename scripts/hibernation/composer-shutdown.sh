@@ -38,6 +38,7 @@ Shutdown-only options:
                            Delete environments in ERROR state even though they
                            cannot be snapshotted (startup restores the previous
                            snapshot, if any).
+                           (or HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT=true)
 EOF
   echo
   common_usage_options
@@ -85,6 +86,12 @@ preflight() {
       result_set "${key}" failed "the Terraform state and the YAML disagree on which environment this is (see log) — not touching it"
       return 0
     fi
+    # A startup refused to decide for the operator (refuse_stale): deleting
+    # now would make that decision silently.
+    if [[ -n "$(manifest_get "${key}" .awaiting_decision.reason)" ]]; then
+      result_set "${key}" failed "not deleting: startup is waiting for an operator decision since $(manifest_get "${key}" .awaiting_decision.since) ($(manifest_get "${key}" .awaiting_decision.reason)) — run startup with HIBERNATE_SKIP_LOAD=true or HIBERNATE_FORCE_LOAD=true first"
+      return 0
+    fi
     # Never delete what cannot be brought back tomorrow: the restore image
     # must still be creatable and able to load the snapshot.
     local current
@@ -100,7 +107,8 @@ preflight() {
       # SNAPSHOT_SAVED: an earlier shutdown deleted the environment but never
       # finished; the newest snapshot entry names the bucket it left behind.
       local orphan=""
-      [[ "${status}" == SNAPSHOT_SAVED ]] && orphan="$(manifest_get "${key}" '.snapshots[0].environment_bucket')"
+      [[ "${status}" == SNAPSHOT_SAVED ]] &&
+        orphan="$(manifest_get "${key}" '[.snapshots[]? | select(.untracked != true and .incomplete != true and .safety != true)][0].environment_bucket')"
       handle_orphaned_buckets "${key}" "${orphan}"
       manifest_transition "${key}" HIBERNATED "environment already absent; latest snapshot kept for restore" ||
         {
@@ -152,6 +160,18 @@ snapshot_env() {
     return 0
   fi
 
+  # Did the last restore into THIS environment complete? Asked before the
+  # snapshot: when the answer is unknown (API error), stop rather than guess.
+  local attempt=NONE
+  status="$(manifest_get "${key}" .status)"
+  if [[ "${status}" == RESTORING ]]; then
+    attempt="$(restore_attempt_state "${key}")"
+    if [[ "${attempt}" == UNKNOWN ]]; then
+      result_set "${key}" failed "could not check whether the last snapshot load completed (Composer API error); environment NOT deleted — re-run the shutdown"
+      return 0
+    fi
+  fi
+
   ensure_snapshot_bucket "${key}" "${sa}" || {
     result_set "${key}" failed "snapshot bucket not usable; environment NOT deleted"
     return 0
@@ -180,12 +200,13 @@ snapshot_env() {
   # incomplete (RESTORING), or an environment re-created empty (e.g. by a
   # deploy) while hibernated — unless it has been running long enough to
   # hold real work.
-  local latest recreated=false fresh=false done=false decision
-  status="$(manifest_get "${key}" .status)"
+  local latest recreated=false fresh=true done=false decision rc
   latest="$(manifest_get "${key}" .latest_snapshot.path)"
   env_recreated_since_snapshot "${key}" && recreated=true
-  env_is_fresh "${key}" && fresh=true
-  [[ "${status}" == RESTORING && "$(restore_attempt_state "${key}")" == SUCCEEDED ]] && done=true
+  # Unknown age counts as fresh here: "keep" retains both snapshots.
+  env_is_fresh "${key}" && rc=0 || rc=$?
+  ((rc != 1)) || fresh=false
+  [[ "${attempt}" == SUCCEEDED ]] && done=true
   decision="$(decide_restore_point "${status:-NONE}" "${recreated}" "${fresh}" "${done}" "$([[ -n "${latest}" ]] && echo true || echo false)")"
   restore_incomplete=false
   case "${decision}" in
@@ -235,7 +256,7 @@ track_abandoned_save() {
 }
 
 # Resolves pending_saves: a finished save's folder joins the snapshot list
-# (untracked, never a restore point) so retention deletes it eventually.
+# (untracked: unverified, never a restore point) so the next prune deletes it.
 resolve_pending_saves() {
   local key="$1" op at out path region project err
   err="${OPT_WORK_DIR}/logs/${key}-pending-saves.log"
@@ -253,7 +274,7 @@ resolve_pending_saves() {
     path="${path%/}"
     if [[ -n "${path}" ]]; then
       info "[${key}] abandoned snapshot save ${op##*/} finished: tracking ${path} for retention"
-      manifest_update "${key}" '.snapshots = ([{path: $p, saved_at: $t, untracked: true}] + (.snapshots // []))' \
+      manifest_update "${key}" '.snapshots = ((.snapshots // []) + [{path: $p, saved_at: $t, untracked: true}])' \
         --arg p "${path}" --arg t "${at}"
     fi
     manifest_update "${key}" '.pending_saves = [(.pending_saves // [])[] | select(.operation != $op)]' --arg op "${op}"
@@ -324,7 +345,8 @@ prune_snapshots() {
   keep="$(setting "${key}" .hibernation.snapshot_retention_count)"
   latest="$(manifest_get "${key}" .latest_snapshot.path)"
   # Never prune the restore point, whatever its position in the list.
-  # Incomplete snapshots (no database dump) are of no use and always go.
+  # Incomplete (no database dump) and untracked (abandoned, unverified)
+  # folders take no retention slot: they always go.
   while IFS= read -r path; do
     [[ -n "${path}" && "${path}" != "${latest}" ]] || continue
     info "[${key}] pruning snapshot ${path} (retention: ${keep})"
@@ -337,7 +359,8 @@ prune_snapshots() {
     fi
   done < <(jq -r --argjson keep "${keep}" --arg latest "${latest}" \
     '[.snapshots[]? | select(.path != $latest)]
-     | ([.[] | select(.incomplete == true)] + ([.[] | select(.incomplete != true)] | .[($keep - 1 | if . < 0 then 0 else . end):]))
+     | ([.[] | select(.incomplete == true or .untracked == true)]
+        + ([.[] | select(.incomplete != true and .untracked != true)] | .[($keep - 1 | if . < 0 then 0 else . end):]))
      | .[].path' \
     "$(manifest_local_path "${key}")")
 }

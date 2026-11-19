@@ -793,8 +793,13 @@ long_ago() { date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ; }
   shutdown_run --env composer-dev
   show_output
   [ "$status" -eq 0 ]
+  [[ "$output" == *"abandoned snapshot save"*"finished: tracking"* ]]
   [ "$(manifest_field composer-dev '.pending_saves | length')" = 0 ]
-  [ "$(manifest_field composer-dev '[.snapshots[] | select(.untracked == true)] | length')" = 1 ]
+  # Untracked (unverified) folders take no retention slot: deleted at once,
+  # every remaining folder is a tracked snapshot.
+  [ "$(manifest_field composer-dev '[.snapshots[] | select(.untracked == true)] | length')" = 0 ]
+  run find "$(gcs_path "$(snapshot_root composer-dev)")" -mindepth 1 -maxdepth 1 -type d
+  [ "${#lines[@]}" -eq "$(manifest_field composer-dev '.snapshots | length')" ]
 }
 
 @test "pin_image_version false: refuses to delete when GCP's default image could not load the snapshot" {
@@ -814,4 +819,162 @@ long_ago() { date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ; }
   [[ "$output" == *"names no environment"* ]]
   [ "$(env_state composer-dev)" = RUNNING ]
   [ "$(env_state composer-test)" = RUNNING ]
+}
+
+
+# ── Final check findings ─────────────────────────────────────────────────────
+
+# Re-created empty while hibernated → shutdown decides "keep" → destroy fails.
+keep_then_failed_destroy() {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  GOOD="$(manifest_field composer-dev .latest_snapshot.path)"
+  manual_deploy
+  FAKE_TF_FAIL_APPLY=before shutdown_run --env composer-dev
+  [ "$status" -eq 1 ]
+  [ "$(env_state composer-dev)" = RUNNING ]
+  [ "$(manifest_field composer-dev .status)" = SNAPSHOT_SAVED ]
+  [ "$(manifest_field composer-dev .latest_snapshot.path)" = "${GOOD}" ]
+}
+
+@test "keep + failed destroy: the next startup still loads the good restore point" {
+  keep_then_failed_destroy
+  startup_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"→ load"* ]]
+  [ "$(env_field composer-dev ._db)" = airflow-db-of-composer-dev ]
+}
+
+@test "keep + failed destroy: a re-run shutdown keeps the good restore point and never prunes it" {
+  keep_then_failed_destroy
+  shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"keeping ${GOOD} as the restore point"* ]]
+  [ "$(manifest_field composer-dev .latest_snapshot.path)" = "${GOOD}" ]
+  [ -f "$(gcs_path "${GOOD}")/airflow-database.sql.gz" ]
+  startup_run --env composer-dev
+  [ "$status" -eq 0 ]
+  [ "$(env_field composer-dev ._db)" = airflow-db-of-composer-dev ]
+}
+
+@test "incomplete restore + keep + failed destroy: the next startup still loads" {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  add_op_fault 'snapshots load composer-dev' 'load failed' 2
+  startup_run --env composer-dev
+  [ "$status" -eq 1 ]
+  FAKE_TF_FAIL_APPLY=before shutdown_run --env composer-dev
+  [ "$status" -eq 1 ]
+  [ "$(manifest_field composer-dev .status)" = SNAPSHOT_SAVED ]
+  startup_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  [ "$(env_field composer-dev ._db)" = airflow-db-of-composer-dev ]
+}
+
+@test "an ERROR environment that existed long outside the cycle is not replaced without --force-load" {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  manual_deploy
+  set_env_field composer-dev ".state = \"ERROR\" | ._db = \"weeks-of-work\" | .createTime = \"$(long_ago)\""
+  local applies
+  applies="$(tf_apply_count)"
+  startup_run --env composer-dev
+  show_output
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"is in ERROR"*"cannot be snapshotted"*"HIBERNATE_FORCE_LOAD=true"* ]]
+  # --skip-load must not turn into "replace it empty".
+  HIBERNATE_SKIP_LOAD=true startup_run --env composer-dev
+  [ "$status" -eq 1 ]
+  [ "$(tf_apply_count)" = "${applies}" ]
+  [ "$(env_field composer-dev ._db)" = weeks-of-work ]
+
+  HIBERNATE_FORCE_LOAD=true startup_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  [ "$(env_state composer-dev)" = RUNNING ]
+  [ "$(env_field composer-dev ._db)" = airflow-db-of-composer-dev ]
+}
+
+@test "a load whose outcome cannot be read (API error) is never guessed: startup and shutdown stop" {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  startup_run --env composer-dev
+  [ "$status" -eq 0 ]
+  set_manifest_field composer-dev '.status = "RESTORING"'
+  set_env_field composer-dev '._db = "work-of-today"'
+  local op loads
+  op="$(manifest_field composer-dev .restore_attempt.operation)"
+  op="${op##*/}"
+  loads="$(gcloud_calls | grep -c '"snapshots", "load", "composer-dev"')"
+  add_fault "operations describe ${op}" 1 'ERROR: (gcloud.composer.operations.describe) UNAVAILABLE: try again' 3
+  startup_run --env composer-dev
+  show_output
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"could not check whether the earlier snapshot load completed"* ]]
+  [ "$(env_field composer-dev ._db)" = work-of-today ]
+  [ "$(gcloud_calls | grep -c '"snapshots", "load", "composer-dev"')" = "${loads}" ]
+
+  add_fault "operations describe ${op}" 1 'ERROR: (gcloud.composer.operations.describe) UNAVAILABLE: try again' 3
+  shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"could not check whether the last snapshot load completed"* ]]
+  [ "$(env_state composer-dev)" = RUNNING ]
+}
+
+@test "loading over a running environment first keeps a safety snapshot of it" {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  manual_deploy
+  set_env_field composer-dev '._db = "weekend-work"'
+  startup_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  [ "$(env_field composer-dev ._db)" = airflow-db-of-composer-dev ]
+  local safety
+  safety="$(manifest_field composer-dev '[.snapshots[] | select(.safety == true)][0].path')"
+  [ -n "${safety}" ] && [ "${safety}" != null ]
+  [ "$(cat "$(gcs_path "${safety}")/airflow-database.sql.gz")" = weekend-work ]
+  [ "$(manifest_field composer-dev .latest_snapshot.path)" != "${safety}" ]
+}
+
+@test "after startup refused to decide, shutdown waits for the operator (HIBERNATE_SKIP_LOAD resolves it)" {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  manual_deploy
+  set_env_field composer-dev "._db = \"weeks-of-work\" | .createTime = \"$(long_ago)\""
+  startup_run --env composer-dev
+  [ "$status" -eq 1 ]
+  [ -n "$(manifest_field composer-dev '.awaiting_decision.since // empty')" ]
+  shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"waiting for an operator decision"* ]]
+  [ "$(env_state composer-dev)" = RUNNING ]
+  ! gcloud_calls | grep -q '"snapshots", "save", "composer-dev"'
+
+  HIBERNATE_SKIP_LOAD=true startup_run --env composer-dev
+  [ "$status" -eq 0 ]
+  [ "$(manifest_field composer-dev '.awaiting_decision // "none"')" = none ]
+  shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  local snap
+  snap="$(manifest_field composer-dev .latest_snapshot.path)"
+  [ "$(cat "$(gcs_path "${snap}")/airflow-database.sql.gz")" = weeks-of-work ]
+}
+
+@test "the bucket grant works when the snapshot bucket policy has a conditional binding" {
+  shutdown_run --env composer-test
+  [ "$status" -eq 0 ]
+  local meta="${FAKE_GCP_DIR}/gcs/${PROJECT}-composer-snapshots/.bucket.json"
+  jq '.iam += [{member: "group:auditors@example.com", role: "roles/storage.objectViewer", condition: {title: "logs-only", expression: "resource.name.startsWith(\"x\")"}}]' \
+    "${meta}" >"${meta}.t" && mv "${meta}.t" "${meta}"
+  shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  [ "$(env_state composer-dev)" = NOT_FOUND ]
 }

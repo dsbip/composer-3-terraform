@@ -7,14 +7,18 @@
 #   1. guard-rails  : hibernation.enabled, not production, valid settings
 #   2. decide       : from the live environment state + hibernation-state.json
 #                     (create+load / load / replace+load / nothing to do)
-#   3. recreate     : ONE targeted `terraform apply` of the environments'
-#                     google_composer_environment resources — built from the
-#                     YAML exactly like a normal deployment. When the YAML
+#   3. recreate     : ONE targeted `terraform apply` of the selected
+#                     environments' module instances (module.composer["<key>"];
+#                     resource-level targets would pull in other environments'
+#                     pending changes) — built from the YAML exactly like a
+#                     normal deployment. When the YAML
 #                     leaves image_version unset, the Airflow version recorded
 #                     at shutdown is pinned so the snapshot is compatible.
 #                     A plan guard refuses anything but create/update inside
 #                     the selected environments.
-#   4. load         : gcloud composer environments snapshots load (Airflow
+#   4. load         : (an environment found running is snapshotted first, so
+#                     loading over it can be undone)
+#                     gcloud composer environments snapshots load (Airflow
 #                     database + dags/plugins/data). PyPI packages, env vars
 #                     and Airflow overrides are skipped by default because
 #                     Terraform already applied them from the YAML.
@@ -39,16 +43,21 @@ Startup-only options:
       --allow-initial-create
                            Allow creating an environment whose module has no
                            resources in the Terraform state yet (first ever
-                           deployment). Without it such environments fail,
-                           which protects against a misconfigured backend.
+                           deployment), or knowingly creating an empty one
+                           when its hibernation state file is missing. Without
+                           it both fail, which protects against a
+                           misconfigured backend or a moved snapshot location.
+                           (or HIBERNATE_ALLOW_INITIAL_CREATE=true)
       --skip-load          Do not load snapshots: recreated environments start
                            empty, running ones are kept as they are; all are
                            marked ACTIVE (the next shutdown's snapshot then
-                           becomes the restore point).
+                           becomes the restore point). (or HIBERNATE_SKIP_LOAD=true)
       --force-load         Load the snapshot even into an environment that has
-                           been running for more than HIBERNATE_FRESH_ENV_HOURS
-                           while the state file says it is hibernated
+                           existed for more than HIBERNATE_FRESH_ENV_HOURS
+                           while the state file says it is hibernated, or
+                           replace such an environment that is in ERROR
                            (overwrites its Airflow database).
+                           (or HIBERNATE_FORCE_LOAD=true)
 EOF
   echo
   common_usage_options
@@ -83,16 +92,29 @@ preflight() {
     result_set "${key}" failed "could not determine the environment state"
     return 0
   }
-  # For a running environment: is it the one that was snapshotted, how long
-  # has it been running, and did an earlier load into it already finish?
-  local recreated=false fresh=true done=false
-  if [[ "${state}" == RUNNING ]]; then
+  # For an existing environment: is it the one the restore point came from,
+  # how long has it existed, and did an earlier load into it already finish?
+  local recreated=false fresh=true done=false frc
+  if [[ "${state}" == RUNNING || "${state}" == ERROR ]]; then
     env_recreated_since_snapshot "${key}" && recreated=true
-    env_is_fresh "${key}" || fresh=false
-    [[ "${status}" == RESTORING && "$(restore_attempt_state "${key}")" == SUCCEEDED ]] && done=true
+    env_is_fresh "${key}" && frc=0 || frc=$?
+    ((frc == 0)) || fresh=false # unknown age: fail closed
+    if [[ "${state}" == RUNNING && "${status}" == RESTORING && "${has_snapshot}" == true ]]; then
+      case "$(restore_attempt_state "${key}")" in
+      SUCCEEDED) done=true ;;
+      UNKNOWN)
+        result_set "${key}" failed "could not check whether the earlier snapshot load completed (Composer API error); nothing loaded — re-run startup"
+        return 0
+        ;;
+      esac
+    fi
   fi
-  # --skip-load / --force-load settle the "running for long" ambiguity.
-  [[ "${OPT_SKIP_LOAD}" == true || "${OPT_FORCE_LOAD}" == true ]] && fresh=true
+  # --force-load settles the "existed for long" ambiguity; --skip-load only
+  # for a running environment (it is kept as it is) — it never allows
+  # replacing an ERROR one, which would destroy its database.
+  if [[ "${OPT_FORCE_LOAD}" == true ]] || [[ "${OPT_SKIP_LOAD}" == true && "${state}" == RUNNING ]]; then
+    fresh=true
+  fi
   action="$(decide_startup_action "${state}" "${status:-NONE}" "${has_snapshot}" "${recreated}" "${fresh}" "${done}")"
   if [[ "${OPT_SKIP_LOAD}" == true ]]; then
     case "${action}" in
@@ -159,7 +181,21 @@ preflight() {
     return 0
     ;;
   refuse_stale)
-    result_set "${key}" failed "environment has been running since $(describe_get "${key}" .createTime) (over ${HIBERNATE_FRESH_ENV_HOURS}h) although the state file says ${status}; loading ${snapshot} would overwrite its Airflow database — re-run with --skip-load to keep it as it is, or with --force-load to replace it with the snapshot"
+    local since why
+    since="$(describe_get "${key}" .createTime)"
+    [[ -n "${since}" ]] || since="an unknown time"
+    if [[ "${state}" == ERROR ]]; then
+      why="environment is in ERROR and has existed since ${since} (over ${HIBERNATE_FRESH_ENV_HOURS}h, or age unknown) although the state file says ${status}; it cannot be snapshotted, so replacing it would destroy its Airflow database — fix it, or re-run startup with HIBERNATE_FORCE_LOAD=true (--force-load) to replace it with ${snapshot}"
+    else
+      why="environment has existed since ${since} (over ${HIBERNATE_FRESH_ENV_HOURS}h, or age unknown) although the state file says ${status}; loading ${snapshot} would overwrite its Airflow database — re-run startup with HIBERNATE_SKIP_LOAD=true (--skip-load) to keep it as it is, or HIBERNATE_FORCE_LOAD=true (--force-load) to replace it with the snapshot"
+    fi
+    # Until someone decides, shutdowns must not decide for them.
+    if [[ "${OPT_DRY_RUN}" != true ]]; then
+      manifest_update "${key}" '.awaiting_decision = (.awaiting_decision // {reason: $r, since: $t})' \
+        --arg r "startup refused to overwrite an environment that existed since ${since}" --arg t "$(_ts)"
+      manifest_push "${key}" || true
+    fi
+    result_set "${key}" failed "${why}"
     return 0
     ;;
   noop)
@@ -175,6 +211,28 @@ preflight() {
 }
 
 # ── Phase 3: load snapshots (parallel, one sub-shell per environment) ───────
+# safety_snapshot KEY — snapshot of a running environment before a load
+# overwrites it, recorded as a "safety" entry (never a restore point; pruned
+# by retention like any other). Failure only warns: the restore goes ahead.
+safety_snapshot() {
+  local key="$1" name region project location path
+  name="$(setting "${key}" .environment_name)"
+  region="$(setting "${key}" .region)"
+  project="$(setting "${key}" .project_id)"
+  location="$(setting "${key}" .hibernation.snapshot_location)"
+  info "[${key}] saving a safety snapshot of the running environment before loading over it"
+  if ! path="$(composer_snapshot_save "${name}" "${region}" "${project}" "${location}")"; then
+    warn "[${key}] could not save a safety snapshot; loading anyway"
+    return 0
+  fi
+  manifest_update "${key}" '.snapshots = ((.snapshots // []) + [{path: $p, saved_at: $t, safety: true,
+      image_version: $i, environment_uuid: $u, environment_created: $c}])' \
+    --arg p "${path}" --arg t "$(_ts)" --arg i "$(describe_get "${key}" .config.softwareConfig.imageVersion)" \
+    --arg u "$(describe_get "${key}" .uuid)" --arg c "$(describe_get "${key}" .createTime)"
+  manifest_push "${key}" || true
+  info "[${key}] safety snapshot: ${path}"
+}
+
 restore_env() {
   local key="$1" action name region project state snapshot sa opts image
   action="$(cat "${ACTION_DIR}/${key}")"
@@ -239,14 +297,32 @@ restore_env() {
   fi
   opts="$(setting "${key}" .hibernation.load_options)"
   # A load an earlier run started (and gave up waiting for) may still be
-  # running: wait for it instead of starting a second one.
-  local loaded=false attempt_op
-  if [[ "$(restore_attempt_state "${key}")" == RUNNING ]]; then
-    attempt_op="$(manifest_get "${key}" .restore_attempt.operation)"
+  # running, or may have finished meanwhile: never start a second one blindly.
+  local loaded=false attempt attempt_op
+  attempt="$(restore_attempt_state "${key}")"
+  attempt_op="$(manifest_get "${key}" .restore_attempt.operation)"
+  case "${attempt}" in
+  UNKNOWN)
+    result_set "${key}" failed "could not check whether the earlier snapshot load completed (Composer API error); nothing loaded — re-run startup"
+    return 0
+    ;;
+  SUCCEEDED)
+    info "[${key}] the snapshot load started earlier (${attempt_op##*/}) has completed; not loading again"
+    loaded=true
+    ;;
+  RUNNING)
     info "[${key}] the snapshot load started earlier (${attempt_op##*/}) is still running; waiting for it"
     wait_for_operation "${attempt_op}" "${region}" "${project}" "snapshot load into ${name}" >/dev/null && loaded=true
     [[ "${loaded}" == true ]] || wait_for_composer_state "${name}" "${region}" "${project}" RUNNING,ERROR >/dev/null || true
-  fi
+    ;;
+  *)
+    # Loading over an environment that was already running: keep what is
+    # there first (best effort), so the overwrite can be undone.
+    if [[ "${action}" == load ]]; then
+      safety_snapshot "${key}"
+    fi
+    ;;
+  esac
   if [[ "${loaded}" != true ]] &&
     ! composer_snapshot_load "${name}" "${region}" "${project}" "${snapshot}" "${opts}" record_restore_attempt "${key}" "${snapshot}"; then
     result_set "${key}" failed "snapshot load failed (state stays RESTORING; re-run startup to retry — a load that still finishes server-side is recognised)"

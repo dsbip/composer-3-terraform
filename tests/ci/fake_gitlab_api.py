@@ -4,6 +4,7 @@ scripts/ci/create-hibernation-schedules.sh (for tests/ci/schedules.bats).
 
 Endpoints (under /api/v4, PRIVATE-TOKEN header required, else 401):
 
+  GET    /projects/:id                                 (default_branch)
   GET    /projects/:id/pipeline_schedules              (page / per_page)
   POST   /projects/:id/pipeline_schedules
   GET    /projects/:id/pipeline_schedules/:sid         (incl. "variables")
@@ -29,7 +30,7 @@ Test control endpoints (no auth, not logged):
   POST /__control/state   replace the state (same shape as --seed)
 
 Seed / state shape:
-  {"project": {"id": 42, "path": "group/project"},
+  {"project": {"id": 42, "path": "group/project", "default_branch": "main"},
    "schedules": [{"id": 1, "description": "...", "ref": "main",
                   "cron": "...", "cron_timezone": "UTC", "active": true,
                   "variables": [{"key": "K", "value": "V"}]}],
@@ -73,7 +74,8 @@ def load_state(seed):
     seed = copy.deepcopy(seed or {})
     project = seed.get("project") or {}
     state = {
-        "project": {"id": int(project.get("id", 42)), "path": project.get("path", "group/composer-3-terraform")},
+        "project": {"id": int(project.get("id", 42)), "path": project.get("path", "group/composer-3-terraform"),
+                    "default_branch": project.get("default_branch", "main")},
         "schedules": [],
         "resource_groups": [],
         "pagination_headers": bool(seed.get("pagination_headers", True)),
@@ -234,6 +236,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self._project_matches(ident):
             return 404, {"message": "404 Project Not Found"}, {}
         parts = rest.split("/") if rest else []
+
+        if not parts and method == "GET":
+            project = STATE["project"]
+            return 200, {"id": project["id"], "path_with_namespace": project["path"],
+                         "default_branch": project["default_branch"]}, {}
 
         if parts[:1] == ["pipeline_schedules"]:
             if len(parts) == 1:

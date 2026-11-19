@@ -352,15 +352,28 @@ def storage(args):
             meta = jload(bucket_meta_path(bucket))
             if meta is None:
                 fail(f"ERROR: (gcloud.storage.buckets.get-iam-policy) gs://{bucket} not found: 404.")
-            roles = {}
+            groups = {}
             for b in meta["iam"]:
-                roles.setdefault(b["role"], []).append(b["member"])
-            out({"bindings": [{"role": r, "members": m} for r, m in sorted(roles.items())],
-                 "etag": "CAE=", "version": 1})
+                k = (b["role"], json.dumps(b.get("condition"), sort_keys=True))
+                groups.setdefault(k, []).append(b["member"])
+            bindings = []
+            for (role, cond), members in sorted(groups.items()):
+                entry = {"role": role, "members": members}
+                if json.loads(cond) is not None:
+                    entry["condition"] = json.loads(cond)
+                bindings.append(entry)
+            out({"bindings": bindings, "etag": "CAE=", "version": 3})
         elif bsub == "add-iam-policy-binding":
             meta = jload(bucket_meta_path(bucket))
             if meta is None:
                 fail(f"ERROR: (gcloud.storage.buckets.add-iam-policy-binding) gs://{bucket} not found: 404.")
+            # Like gcloud (iam_util.AddBindingToIamPolicyWithCondition): a policy
+            # with any conditional binding needs an explicit --condition when
+            # prompts are disabled.
+            if any(x.get("condition") for x in meta["iam"]) and "--condition" not in flags:
+                fail("ERROR: (gcloud.storage.buckets.add-iam-policy-binding) Adding a binding without specifying "
+                     "a condition to a policy containing conditions is prohibited in non-interactive mode. Run the "
+                     "command again with `--condition=None`")
             b = {"member": flags["--member"], "role": flags["--role"]}
             if b not in meta["iam"]:
                 meta["iam"].append(b)

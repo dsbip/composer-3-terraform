@@ -38,8 +38,10 @@ Options (each also settable through the environment variable shown):
                                                owned by (run as) its user.
   --project ID|PATH        PROJECT_ID          numeric id or 'group/project'
                                                (default: \$CI_PROJECT_ID)
-  --ref REF                REF                 branch the schedules run on
-                                               (default: main)
+  --ref REF                REF                 branch the schedules run on; must
+                                               be the project's default branch
+                                               (the hibernation jobs run only
+                                               there). Default: looked up
   --timezone TZ            TIMEZONE            cron timezone
                                                (default: Europe/London)
   --shutdown-cron CRON     SHUTDOWN_CRON       default: '0 19 * * 1-5'
@@ -80,7 +82,7 @@ usage_error() {
 # ── Inputs ──────────────────────────────────────────────────────────────────
 GITLAB_API_URL="${GITLAB_API_URL:-${CI_API_V4_URL:-}}"
 PROJECT_ID="${PROJECT_ID:-${CI_PROJECT_ID:-}}"
-REF="${REF:-main}"
+REF="${REF:-}"
 TIMEZONE="${TIMEZONE:-Europe/London}"
 SHUTDOWN_CRON="${SHUTDOWN_CRON:-0 19 * * 1-5}"
 STARTUP_CRON="${STARTUP_CRON:-0 7 * * 1-5}"
@@ -178,7 +180,6 @@ fi
 PROJECT_ID="$(trim "${PROJECT_ID}")"
 [[ -n "${PROJECT_ID}" ]] || usage_error "PROJECT_ID is required (default \$CI_PROJECT_ID is not set)"
 REF="$(trim "${REF}")"
-[[ -n "${REF}" ]] || usage_error "REF must not be empty"
 TIMEZONE="$(trim "${TIMEZONE}")"
 [[ -n "${TIMEZONE}" ]] || usage_error "TIMEZONE must not be empty"
 DESCRIPTION_PREFIX="$(trim "${DESCRIPTION_PREFIX}")"
@@ -495,8 +496,24 @@ set_resource_group_mode() {
   changed "resource group ${RESOURCE_GROUP}: process_mode $(would set set) to oldest_first (was ${mode:-unknown})"
 }
 
+# The hibernation jobs only run on the project's default branch, so a
+# schedule on any other ref would fire every night and do nothing.
+resolve_ref() {
+  local default
+  api_ok GET "${P}"
+  default="$(jq -r '.default_branch // empty' "${WORK}/body")"
+  [[ -n "${default}" ]] || { error "project ${PROJECT_ID} has no default branch (empty repository?)"; exit 1; }
+  if [[ -z "${REF}" ]]; then
+    REF="${default}"
+  elif [[ "${REF}" != "${default}" && "${REF}" != "refs/heads/${default}" ]]; then
+    usage_error "REF '${REF}' is not the project's default branch '${default}': the hibernation jobs only run on the default branch"
+  fi
+  REF="${REF#refs/heads/}"
+}
+
 # ── Main ────────────────────────────────────────────────────────────────────
 ${DRY_RUN} && info "dry run: no changes will be made"
+resolve_ref
 list_schedules
 ensure_schedule shutdown "${SHUTDOWN_CRON}"
 ensure_schedule startup "${STARTUP_CRON}"

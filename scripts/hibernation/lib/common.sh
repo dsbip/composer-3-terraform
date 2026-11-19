@@ -147,10 +147,13 @@ with_lock() {
   return "${rc}"
 }
 
-# rfc3339_epoch TIMESTAMP -> seconds since epoch (empty when unparsable)
+# rfc3339_epoch TIMESTAMP -> seconds since epoch (empty when unparsable).
+# jq first (no GNU date needed; Google APIs return UTC "...[.fraction]Z"),
+# then GNU date for other offsets.
 rfc3339_epoch() {
   [[ -n "$1" ]] || return 0
-  date -u -d "$1" +%s 2>/dev/null || true
+  jq -nr --arg t "$1" '$t | sub("(\\.[0-9]+)?(Z|[+]00:00)$"; "Z") | fromdateiso8601' 2>/dev/null ||
+    date -u -d "$1" +%s 2>/dev/null || true
 }
 
 # True when a gcloud error text means "the resource does not exist".
@@ -248,6 +251,15 @@ parse_common_args() {
   local cli_envs=() cli_envs_given=false cli_var_files=() cli_var_files_given=false value n
   is_true "${HIBERNATE_DRY_RUN:-false}" && OPT_DRY_RUN=true
   is_true "${HIBERNATE_SKIP_INIT:-false}" && OPT_SKIP_INIT=true
+  # Recovery flags as variables, so a manual GitLab run can pass them (each
+  # only applies to its own script; combine with HIBERNATE_ENVIRONMENTS).
+  if [[ "${mode}" == shutdown ]]; then
+    is_true "${HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT:-false}" && OPT_FORCE_NO_SNAPSHOT=true
+  else
+    is_true "${HIBERNATE_ALLOW_INITIAL_CREATE:-false}" && OPT_ALLOW_INITIAL_CREATE=true
+    is_true "${HIBERNATE_SKIP_LOAD:-false}" && OPT_SKIP_LOAD=true
+    is_true "${HIBERNATE_FORCE_LOAD:-false}" && OPT_FORCE_LOAD=true
+  fi
 
   while (($#)); do
     case "$1" in
@@ -991,8 +1003,10 @@ grant_bucket_object_admin() {
     return 0
   fi
   info "[${key}] granting roles/storage.objectAdmin on gs://${bucket} to ${sa}"
+  # --condition=None: gcloud refuses (non-interactively) to add a binding to a
+  # policy that contains any conditional binding unless this is explicit.
   retry gcloud storage buckets add-iam-policy-binding "gs://${bucket}" \
-    --member="serviceAccount:${sa}" --role=roles/storage.objectAdmin --quiet >/dev/null || {
+    --member="serviceAccount:${sa}" --role=roles/storage.objectAdmin --condition=None --quiet >/dev/null || {
     error "[${key}] could not grant ${sa} access to gs://${bucket}"
     return 1
   }
@@ -1059,7 +1073,8 @@ manifest_transition() {
   manifest_update "${key}" '
     .status = $s
     | .updated_at = $t
-    | .history = ([{at: $t, status: $s, detail: $d, pipeline: $ci}] + (.history // []))[:$max]' \
+    | .history = ([{at: $t, status: $s, detail: $d, pipeline: $ci}] + (.history // []))[:$max]
+    | if $s == "ACTIVE" then del(.awaiting_decision) else . end' \
     --arg s "${status}" --arg t "$(_ts)" --arg d "${detail}" \
     --argjson max "${HIB_HISTORY_MAX}" --argjson ci "$(ci_context_json)"
   manifest_push "${key}"
@@ -1355,9 +1370,9 @@ decide_shutdown_action() {
 }
 
 # decide_startup_action STATE MANIFEST_STATUS HAS_SNAPSHOT [RECREATED] [FRESH] [RESTORE_DONE]
-#   RECREATED     the running environment is not the one last snapshotted
-#                 (different uuid) — only consulted for SNAPSHOT_SAVED
-#   FRESH         the running environment is younger than HIBERNATE_FRESH_ENV_HOURS
+#   RECREATED     the environment is not the one the restore point was taken
+#                 of (env_recreated_since_snapshot) — consulted for SNAPSHOT_SAVED
+#   FRESH         the environment is younger than HIBERNATE_FRESH_ENV_HOURS
 #   RESTORE_DONE  a recorded snapshot load into THIS environment succeeded
 #   prints one of:
 #     create_and_load   environment absent, snapshot available
@@ -1367,7 +1382,8 @@ decide_shutdown_action() {
 #     mark_restored     the load finished earlier; only the state file lags
 #     mark_active       environment kept running (shutdown never deleted it)
 #     refuse_stale      environment re-created long ago outside the cycle;
-#                       loading would overwrite real work
+#                       loading (RUNNING) or replacing (ERROR) would destroy
+#                       real work
 #     noop              nothing to do
 #     error:<reason>
 decide_startup_action() {
@@ -1395,12 +1411,20 @@ decide_startup_action() {
     fi
     ;;
   ERROR)
+    # A replacement deletes the environment without a snapshot of it (an
+    # ERROR environment cannot be snapshotted): fine when the snapshot is of
+    # this very environment, or when it is new; not when it has been running
+    # outside the cycle for long (it may hold real work).
     case "${status}" in
     HIBERNATED | RESTORING | SNAPSHOT_SAVED)
-      if [[ "${has_snapshot}" == true ]]; then
+      if [[ "${has_snapshot}" != true ]]; then
+        echo "error:environment is in ERROR state and there is no snapshot to restore"
+      elif [[ "${status}" == SNAPSHOT_SAVED && "${recreated}" != true ]]; then
+        echo replace_and_load
+      elif [[ "${fresh}" == true ]]; then
         echo replace_and_load
       else
-        echo "error:environment is in ERROR state and there is no snapshot to restore"
+        echo refuse_stale
       fi
       ;;
     *) echo "error:environment is in ERROR state outside a hibernation cycle; fix or recreate it manually" ;;
@@ -1434,29 +1458,44 @@ decide_restore_point() {
   fi
 }
 
-# env_is_fresh KEY — the described environment was created less than
-# HIBERNATE_FRESH_ENV_HOURS ago (unknown creation time counts as fresh).
+# env_is_fresh KEY — 0 when the described environment was created less than
+# HIBERNATE_FRESH_ENV_HOURS ago, 1 when older, 2 when the creation time is
+# missing or unparsable (callers fail closed: startup treats it as not fresh,
+# shutdown keeps the old restore point).
 env_is_fresh() {
-  local created
-  created="$(rfc3339_epoch "$(describe_get "$1" .createTime)")"
-  [[ -z "${created}" ]] && return 0
+  local raw created
+  raw="$(describe_get "$1" .createTime)"
+  created="$(rfc3339_epoch "${raw}")"
+  if [[ -z "${created}" ]]; then
+    warn "[$1] cannot tell the environment's age (createTime '${raw}')"
+    return 2
+  fi
   (($(now_epoch) - created < HIBERNATE_FRESH_ENV_HOURS * 3600))
 }
 
 # env_recreated_since_snapshot KEY — the described environment is not the one
-# the newest snapshot was taken of (both uuids must be known).
+# the RESTORE POINT (latest_snapshot) was taken of, so it never held that
+# data. Compared with the restore point, not the newest list entry: after a
+# "keep" the newest entry is a secondary snapshot of this very environment.
+# Without uuids (state files written before they were recorded) a "keep" is
+# still recognised by the restore_incomplete flag on the newest entry.
 env_recreated_since_snapshot() {
   local now_uuid snap_uuid
   now_uuid="$(describe_get "$1" .uuid)"
-  snap_uuid="$(manifest_get "$1" '.snapshots[0].environment_uuid')"
-  [[ -n "${now_uuid}" && -n "${snap_uuid}" && "${now_uuid}" != "${snap_uuid}" ]]
+  snap_uuid="$(manifest_get "$1" '.latest_snapshot.environment_uuid')"
+  if [[ -n "${now_uuid}" && -n "${snap_uuid}" ]]; then
+    [[ "${now_uuid}" != "${snap_uuid}" ]]
+    return
+  fi
+  [[ "$(manifest_get "$1" '.snapshots[0].restore_incomplete')" == true ]]
 }
 
-# restore_attempt_state KEY -> SUCCEEDED | RUNNING | FAILED | NONE for the
-# snapshot load recorded in the state file, when it targeted the described
-# environment (same uuid) and the current restore point.
+# restore_attempt_state KEY -> SUCCEEDED | RUNNING | FAILED | NONE | UNKNOWN
+# for the snapshot load recorded in the state file, when it targeted the
+# described environment (same uuid) and the current restore point. UNKNOWN =
+# the operation could not be read (API error): callers must not guess.
 restore_attempt_state() {
-  local key="$1" op uuid snap out
+  local key="$1" op uuid snap out err rc
   op="$(manifest_get "${key}" .restore_attempt.operation)"
   uuid="$(manifest_get "${key}" .restore_attempt.environment_uuid)"
   snap="$(manifest_get "${key}" .restore_attempt.snapshot)"
@@ -1465,11 +1504,20 @@ restore_attempt_state() {
     echo NONE
     return 0
   fi
+  err="$(mktemp)"
   out="$(retry gcloud composer operations describe "${op##*/}" --location="$(setting "${key}" .region)" \
-    --project="$(setting "${key}" .project_id)" --format=json 2>/dev/null)" || {
-    echo NONE
+    --project="$(setting "${key}" .project_id)" --format=json 2>"${err}")" && rc=0 || rc=$?
+  if ((rc != 0)); then
+    if is_not_found_error "$(cat "${err}")"; then
+      echo NONE # operations expire
+    else
+      cat "${err}" >&2
+      echo UNKNOWN
+    fi
+    rm -f "${err}"
     return 0
-  }
+  fi
+  rm -f "${err}"
   if [[ "$(jq -r '.done // false' <<<"${out}")" != true ]]; then
     echo RUNNING
   elif jq -e '.error' >/dev/null <<<"${out}"; then

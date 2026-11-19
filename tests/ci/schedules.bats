@@ -203,15 +203,29 @@ sched() {
   [[ "${output}" == *"updated (cron '0 19 * * 1-5' -> '30 18 * * 1-5')"* ]]
 }
 
-@test "timezone and ref changes are applied with PUT" {
+@test "timezone and ref changes are applied with PUT (ref = the project's default branch)" {
+  seed '{"project": {"id": 42, "default_branch": "trunk"}}'
   run "${SCRIPT}"
   [ "${status}" -eq 0 ]
+  [ "$(state | jq -r '[.schedules[].ref] | unique | join(",")')" = "trunk" ]
+  # The default branch changes (e.g. renamed): the schedules follow it.
+  seed "$(state | jq -c '.project.default_branch = "main"')"
   reset_log
-  TIMEZONE=UTC REF=develop run "${SCRIPT}"
+  TIMEZONE=UTC run "${SCRIPT}"
   [ "${status}" -eq 0 ]
-  [ "$(count '.method == "PUT" and .form.cron_timezone == "UTC" and .form.ref == "develop"')" -eq 2 ]
+  [ "$(count '.method == "PUT" and .form.cron_timezone == "UTC" and .form.ref == "main"')" -eq 2 ]
   [ "$(count '.method == "POST"')" -eq 0 ]
-  [ "$(state | jq -r '[.schedules[] | "\(.ref) \(.cron_timezone)"] | unique | join(",")')" = "develop UTC" ]
+  [ "$(state | jq -r '[.schedules[] | "\(.ref) \(.cron_timezone)"] | unique | join(",")')" = "main UTC" ]
+}
+
+@test "a REF other than the default branch is refused (the jobs would never run there)" {
+  REF=develop run "${SCRIPT}"
+  [ "${status}" -eq 2 ]
+  [[ "${output}" == *"is not the project's default branch 'main'"* ]]
+  [ "$(mutations)" -eq 0 ]
+  REF=refs/heads/main run "${SCRIPT}"
+  [ "${status}" -eq 0 ]
+  [ "$(state | jq -r '[.schedules[].ref] | unique | join(",")')" = "main" ]
 }
 
 @test "cron whitespace is normalised and not reported as a change" {
@@ -532,7 +546,7 @@ pagination_seed() {
 # ── Inputs: flags, defaults, project paths ──────────────────────────────────
 @test "every input has a --flag equivalent (also --flag=value) that overrides the environment" {
   printf '%s' "${TOKEN}" >"${BATS_TEST_TMPDIR}/token"
-  seed '{"project": {"id": 7, "path": "team/composer"}}'
+  seed '{"project": {"id": 7, "path": "team/composer", "default_branch": "develop"}}'
   REF=ignored TIMEZONE=ignored run env -u GITLAB_TOKEN -u GITLAB_API_URL -u PROJECT_ID "${SCRIPT}" \
     --api-url "${FAKE_URL}/api/v4/" --token-file "${BATS_TEST_TMPDIR}/token" --project team/composer \
     --ref=develop --timezone America/New_York --shutdown-cron '15 18 * * 1-4' --startup-cron='45 6 * * 1-4' \
@@ -545,7 +559,7 @@ pagination_seed() {
   [ "$(var "QA hibernation: startup" HIBERNATE_ENVIRONMENTS)" = composer-qa ]
   [ "$(var "QA hibernation: startup" HIBERNATE_ACTION)" = startup ]
   # Project paths are URL-encoded (the fake 404s on an unencoded slash).
-  [ "$(count '(.path | startswith("/api/v4/projects/team%2Fcomposer/")) | not')" -eq 0 ]
+  [ "$(count '(.path | test("^/api/v4/projects/team%2Fcomposer(/|$)")) | not')" -eq 0 ]
 }
 
 @test "defaults come from CI_API_V4_URL / CI_PROJECT_ID" {
@@ -554,7 +568,7 @@ pagination_seed() {
     run env -u GITLAB_API_URL -u PROJECT_ID "${SCRIPT}"
   [ "${status}" -eq 0 ]
   [ "$(state | jq '.schedules | length')" -eq 2 ]
-  [ "$(count '.path | startswith("/api/v4/projects/group%2Fcomposer-3-terraform/pipeline_schedules")')" -eq "$(requests 'length')" ]
+  [ "$(count '.path | test("^/api/v4/projects/group%2Fcomposer-3-terraform(/|$)")')" -eq "$(requests 'length')" ]
 }
 
 @test "a custom DESCRIPTION_PREFIX manages its own pair and leaves the default pair alone" {
