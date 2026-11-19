@@ -251,14 +251,15 @@ parse_common_args() {
   local cli_envs=() cli_envs_given=false cli_var_files=() cli_var_files_given=false value n
   is_true "${HIBERNATE_DRY_RUN:-false}" && OPT_DRY_RUN=true
   is_true "${HIBERNATE_SKIP_INIT:-false}" && OPT_SKIP_INIT=true
-  # Recovery flags as variables, so a manual GitLab run can pass them (each
-  # only applies to its own script; combine with HIBERNATE_ENVIRONMENTS).
+  # Recovery flags as variables, so a one-off manual GitLab run can pass them
+  # (each only applies to its own script). Applied after the arguments.
+  local env_recovery=() cli_load_choice=false v
   if [[ "${mode}" == shutdown ]]; then
-    is_true "${HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT:-false}" && OPT_FORCE_NO_SNAPSHOT=true
+    is_true "${HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT:-false}" && env_recovery+=(HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT)
   else
-    is_true "${HIBERNATE_ALLOW_INITIAL_CREATE:-false}" && OPT_ALLOW_INITIAL_CREATE=true
-    is_true "${HIBERNATE_SKIP_LOAD:-false}" && OPT_SKIP_LOAD=true
-    is_true "${HIBERNATE_FORCE_LOAD:-false}" && OPT_FORCE_LOAD=true
+    for v in HIBERNATE_ALLOW_INITIAL_CREATE HIBERNATE_SKIP_LOAD HIBERNATE_FORCE_LOAD; do
+      is_true "${!v:-false}" && env_recovery+=("${v}")
+    done
   fi
 
   while (($#)); do
@@ -327,11 +328,13 @@ parse_common_args() {
     --skip-load)
       [[ "${mode}" == startup ]] || die "$1 is only valid for composer-startup.sh"
       OPT_SKIP_LOAD=true
+      cli_load_choice=true
       shift
       ;;
     --force-load)
       [[ "${mode}" == startup ]] || die "$1 is only valid for composer-startup.sh"
       OPT_FORCE_LOAD=true
+      cli_load_choice=true
       shift
       ;;
     -h | --help)
@@ -357,9 +360,34 @@ parse_common_args() {
   elif [[ -n "${HIBERNATE_TF_VAR_FILES:-}" ]]; then
     mapfile -t OPT_VAR_FILES < <(split_words "${HIBERNATE_TF_VAR_FILES}")
   fi
-  [[ "${OPT_SKIP_LOAD}" != true || "${OPT_FORCE_LOAD}" != true ]] || die "--skip-load and --force-load are mutually exclusive"
+  # A recovery variable left behind in a schedule or in the project's CI/CD
+  # variables would apply to every night and every environment: refuse that.
+  if ((${#env_recovery[@]})); then
+    [[ "${CI_PIPELINE_SOURCE:-}" != schedule ]] ||
+      die "recovery variable(s) ${env_recovery[*]} must not be set for scheduled pipelines; set them only on a one-off 'Run pipeline' (remove them from the schedule and from the CI/CD variables)"
+    ((${#OPT_ENVS[@]})) ||
+      die "recovery variable(s) ${env_recovery[*]} need HIBERNATE_ENVIRONMENTS (or --env) naming the environment(s) they are meant for"
+    for v in "${env_recovery[@]}"; do
+      case "${v}" in
+      HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT) OPT_FORCE_NO_SNAPSHOT=true ;;
+      HIBERNATE_ALLOW_INITIAL_CREATE) OPT_ALLOW_INITIAL_CREATE=true ;;
+      # An explicit --skip-load / --force-load replaces both variables.
+      HIBERNATE_SKIP_LOAD) [[ "${cli_load_choice}" == true ]] || OPT_SKIP_LOAD=true ;;
+      HIBERNATE_FORCE_LOAD) [[ "${cli_load_choice}" == true ]] || OPT_FORCE_LOAD=true ;;
+      esac
+    done
+  fi
+  [[ "${OPT_SKIP_LOAD}" != true || "${OPT_FORCE_LOAD}" != true ]] ||
+    die "--skip-load / HIBERNATE_SKIP_LOAD and --force-load / HIBERNATE_FORCE_LOAD are mutually exclusive"
+  HIB_ACTIVE_OPTIONS=()
+  [[ "${OPT_FORCE_NO_SNAPSHOT}" != true ]] || HIB_ACTIVE_OPTIONS+=(force-delete-without-snapshot)
+  [[ "${OPT_ALLOW_INITIAL_CREATE}" != true ]] || HIB_ACTIVE_OPTIONS+=(allow-initial-create)
+  [[ "${OPT_SKIP_LOAD}" != true ]] || HIB_ACTIVE_OPTIONS+=(skip-load)
+  [[ "${OPT_FORCE_LOAD}" != true ]] || HIB_ACTIVE_OPTIONS+=(force-load)
+  ((${#HIB_ACTIVE_OPTIONS[@]} == 0)) || warn "recovery option(s) active: ${HIB_ACTIVE_OPTIONS[*]} (environments: ${OPT_ENVS[*]:-all enabled})"
   [[ -n "${OPT_CONFIG}" ]] || die "--config (or HIBERNATE_CONFIG_FILE) is required"
 }
+HIB_ACTIVE_OPTIONS=()
 
 # ── Work directory (logs, plans, manifests, summary — kept as CI artifacts) ─
 # The per-environment bookkeeping (actions/, state/, results/) drives the
@@ -749,6 +777,18 @@ composer_snapshot_load() {
   return 1
 }
 
+# A save that was accepted but then abandoned (poll failures, timeout) keeps
+# running server-side; remember it so its folder is tracked and pruned by the
+# next shutdown (resolve_pending_saves).
+track_abandoned_save() {
+  local key="$1" op_file="$2" op
+  [[ -s "${op_file}" ]] || return 1
+  op="$(cat "${op_file}")"
+  manifest_update "${key}" '.pending_saves = ((.pending_saves // []) + [{operation: $op, at: $t}])' \
+    --arg op "${op}" --arg t "$(_ts)"
+  manifest_push "${key}" || true
+}
+
 # ── Image versions ──────────────────────────────────────────────────────────
 # Prints the image versions that can currently be used to CREATE environments
 # in a location (Composer REST API; GA gcloud has no listing command). The
@@ -1073,10 +1113,12 @@ manifest_transition() {
   manifest_update "${key}" '
     .status = $s
     | .updated_at = $t
-    | .history = ([{at: $t, status: $s, detail: $d, pipeline: $ci}] + (.history // []))[:$max]
+    | .history = ([{at: $t, status: $s, detail: $d, pipeline: $ci}
+        + (if ($opts | length) > 0 then {options: $opts} else {} end)] + (.history // []))[:$max]
     | if $s == "ACTIVE" then del(.awaiting_decision) else . end' \
     --arg s "${status}" --arg t "$(_ts)" --arg d "${detail}" \
-    --argjson max "${HIB_HISTORY_MAX}" --argjson ci "$(ci_context_json)"
+    --argjson max "${HIB_HISTORY_MAX}" --argjson ci "$(ci_context_json)" \
+    --argjson opts "$(jq -nc '$ARGS.positional' --args -- "${HIB_ACTIVE_OPTIONS[@]}")"
   manifest_push "${key}"
 }
 
@@ -1421,6 +1463,8 @@ decide_startup_action() {
         echo "error:environment is in ERROR state and there is no snapshot to restore"
       elif [[ "${status}" == SNAPSHOT_SAVED && "${recreated}" != true ]]; then
         echo replace_and_load
+      elif [[ "${status}" == RESTORING && "${done}" == true ]]; then
+        echo refuse_stale # the restore had completed: it may hold newer work
       elif [[ "${fresh}" == true ]]; then
         echo replace_and_load
       else
@@ -1524,6 +1568,20 @@ restore_attempt_state() {
     echo FAILED
   else
     echo SUCCEEDED
+  fi
+}
+
+# clear_stale_decision KEY STATE — an awaiting_decision raised by a startup
+# for an environment that is gone (or replaced by another one) no longer
+# applies, so it must not keep blocking shutdowns.
+clear_stale_decision() {
+  local key="$1" state="$2" uuid
+  [[ -n "$(manifest_get "${key}" .awaiting_decision.reason)" ]] || return 0
+  uuid="$(manifest_get "${key}" .awaiting_decision.environment_uuid)"
+  if [[ "${state}" == NOT_FOUND || (-n "${uuid}" && "${uuid}" != "$(describe_get "${key}" .uuid)") ]]; then
+    info "[${key}] the environment a startup refused to overwrite is gone; dropping the pending decision"
+    manifest_update "${key}" 'del(.awaiting_decision)'
+    [[ "${OPT_DRY_RUN}" == true ]] || manifest_push "${key}" || true
   fi
 }
 

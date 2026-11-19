@@ -2201,6 +2201,9 @@ TABLE
   ACTIVE         true  true      true  error:outside a hibernation cycle
 TABLE
   assert_eq "${n}" 9 "rows"
+  # The snapshot had already been loaded into it: it may hold newer work.
+  assert_eq "$(decide_startup_action ERROR RESTORING true false true true)" refuse_stale
+  assert_eq "$(decide_startup_action ERROR RESTORING true false true false)" replace_and_load
   if ((${#failures[@]})); then
     printf '%s\n' "${failures[@]}" >&2
     return 1
@@ -2221,17 +2224,42 @@ TABLE
 
 @test "parse_common_args: recovery flags can come from HIBERNATE_* variables, each for its own script" {
   HIBERNATE_SKIP_LOAD=true HIBERNATE_ALLOW_INITIAL_CREATE=yes HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT=true \
-    run bash "${UNIT}/parse-args.sh" startup -c x.yaml
+    run bash "${UNIT}/parse-args.sh" startup -c x.yaml --env composer-dev
   assert_status 0
   assert_contains "${output}" "skip_load=true"
   assert_contains "${output}" "allow_initial_create=true"
   assert_contains "${output}" "force_no_snapshot=false"
-  HIBERNATE_FORCE_LOAD=1 HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT=true run bash "${UNIT}/parse-args.sh" shutdown -c x.yaml
+  assert_contains "${output}" "recovery option(s) active: allow-initial-create skip-load (environments: composer-dev)"
+  HIBERNATE_ENVIRONMENTS=composer-dev HIBERNATE_FORCE_LOAD=1 HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT=true \
+    run bash "${UNIT}/parse-args.sh" shutdown -c x.yaml
   assert_status 0
   assert_contains "${output}" "force_no_snapshot=true"
   assert_contains "${output}" "force_load=false"
-  HIBERNATE_FORCE_LOAD=true HIBERNATE_SKIP_LOAD=true run bash "${UNIT}/parse-args.sh" startup -c x.yaml
+  HIBERNATE_FORCE_LOAD=true HIBERNATE_SKIP_LOAD=true run bash "${UNIT}/parse-args.sh" startup -c x.yaml --env composer-dev
   assert_status 2
+  assert_contains "${output}" "HIBERNATE_SKIP_LOAD and --force-load / HIBERNATE_FORCE_LOAD are mutually exclusive"
+  # An explicit --skip-load / --force-load replaces both load variables.
+  HIBERNATE_SKIP_LOAD=true run bash "${UNIT}/parse-args.sh" startup -c x.yaml --env composer-dev --force-load
+  assert_status 0
+  assert_contains "${output}" "skip_load=false"
+  assert_contains "${output}" "force_load=true"
+}
+
+@test "parse_common_args: recovery variables are refused on schedules and without an explicit selection" {
+  HIBERNATE_SKIP_LOAD=true run bash "${UNIT}/parse-args.sh" startup -c x.yaml
+  assert_status 2
+  assert_contains "${output}" "need HIBERNATE_ENVIRONMENTS (or --env)"
+  CI_PIPELINE_SOURCE=schedule HIBERNATE_ENVIRONMENTS=composer-dev HIBERNATE_FORCE_LOAD=true \
+    run bash "${UNIT}/parse-args.sh" startup -c x.yaml
+  assert_status 2
+  assert_contains "${output}" "must not be set for scheduled pipelines"
+  CI_PIPELINE_SOURCE=schedule HIBERNATE_ENVIRONMENTS=composer-dev HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT=1 \
+    run bash "${UNIT}/parse-args.sh" shutdown -c x.yaml
+  assert_status 2
+  # Variables for the other script do not count; false does not count.
+  CI_PIPELINE_SOURCE=schedule HIBERNATE_SKIP_LOAD=true HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT=false \
+    run bash "${UNIT}/parse-args.sh" shutdown -c x.yaml
+  assert_status 0
 }
 
 @test "manifest_transition: ACTIVE clears a pending operator decision" {
@@ -2242,6 +2270,26 @@ TABLE
   assert_eq "$(manifest_get composer-dev .awaiting_decision.reason)" r
   manifest_transition composer-dev ACTIVE "y" 2>/dev/null
   assert_eq "$(manifest_get composer-dev .awaiting_decision)" ""
+  # Active recovery options are recorded in the history entry.
+  HIB_ACTIVE_OPTIONS=(skip-load)
+  manifest_transition composer-dev ACTIVE "z" 2>/dev/null
+  assert_eq "$(manifest_get composer-dev '.history[0].options | join(",")')" skip-load
+  assert_eq "$(manifest_get composer-dev '.history[1] | has("options")')" false
+}
+
+@test "clear_stale_decision: dropped when the environment is gone or another one, kept for the same one" {
+  manifest_new composer-dev >"$(manifest_local_path composer-dev)"
+  OPT_DRY_RUN=true
+  echo '{"uuid": "u-1"}' >"${OPT_WORK_DIR}/state/composer-dev-describe.json"
+  manifest_update composer-dev '.awaiting_decision = {reason: "r", since: "t", environment_uuid: "u-1"}'
+  clear_stale_decision composer-dev RUNNING 2>/dev/null
+  assert_eq "$(manifest_get composer-dev .awaiting_decision.reason)" r "same environment"
+  echo '{"uuid": "u-2"}' >"${OPT_WORK_DIR}/state/composer-dev-describe.json"
+  clear_stale_decision composer-dev RUNNING 2>/dev/null
+  assert_eq "$(manifest_get composer-dev .awaiting_decision)" "" "another environment"
+  manifest_update composer-dev '.awaiting_decision = {reason: "r", since: "t", environment_uuid: "u-2"}'
+  clear_stale_decision composer-dev NOT_FOUND 2>/dev/null
+  assert_eq "$(manifest_get composer-dev .awaiting_decision)" "" "environment gone"
 }
 
 @test "restore_attempt_state: SUCCEEDED / FAILED / RUNNING only for the described environment and restore point" {
@@ -2393,4 +2441,14 @@ TABLE
     '{"skip_pypi_packages_installation": true}' record composer-dev
   assert_status 0
   assert_eq "$(cat "${BATS_TEST_TMPDIR}/started")" "composer-dev projects/p/locations/r/operations/op-load-7"
+}
+
+@test "track_abandoned_save: 1 when the save was never accepted, 0 and recorded when it is still running" {
+  manifest_new composer-dev >"$(manifest_local_path composer-dev)"
+  OPT_DRY_RUN=true
+  run track_abandoned_save composer-dev "${BATS_TEST_TMPDIR}/no-op-file"
+  assert_status 1
+  echo "projects/p/locations/r/operations/op-safety-1" >"${BATS_TEST_TMPDIR}/op"
+  track_abandoned_save composer-dev "${BATS_TEST_TMPDIR}/op" 2>/dev/null
+  assert_eq "$(manifest_get composer-dev '.pending_saves[0].operation')" "projects/p/locations/r/operations/op-safety-1"
 }

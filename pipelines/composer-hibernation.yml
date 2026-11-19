@@ -25,9 +25,11 @@
 # HIBERNATE_ACTION=shutdown or startup (runs immediately), or without it to
 # get manual buttons. HIBERNATE_ENVIRONMENTS set to an empty value is refused
 # (delete the variable instead to select every enabled environment).
-# Recovery options as variables on such a run (with HIBERNATE_ENVIRONMENTS):
-# HIBERNATE_SKIP_LOAD / HIBERNATE_FORCE_LOAD / HIBERNATE_ALLOW_INITIAL_CREATE
-# (startup), HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT (shutdown).
+# Recovery options as variables on such a one-off run, together with
+# HIBERNATE_ENVIRONMENTS (required): HIBERNATE_SKIP_LOAD / HIBERNATE_FORCE_LOAD /
+# HIBERNATE_ALLOW_INITIAL_CREATE (startup), HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT
+# (shutdown). Never set them on a schedule or as CI/CD variables: the scripts
+# refuse them on scheduled pipelines.
 #
 # After the first run of each job, set the resource group to oldest_first so a
 # delayed shutdown can never be overtaken by the next startup:

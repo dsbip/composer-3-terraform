@@ -71,6 +71,7 @@ preflight() {
     result_set "${key}" failed "could not determine the environment state"
     return 0
   }
+  clear_stale_decision "${key}" "${state}"
   action="$(decide_shutdown_action "${state}" "${status:-NONE}" "${has_snapshot}" "${OPT_FORCE_NO_SNAPSHOT}")"
   info "[${key}] environment=${state} state-file=${status:-NONE} snapshot-available=${has_snapshot} → ${action}"
 
@@ -89,7 +90,7 @@ preflight() {
     # A startup refused to decide for the operator (refuse_stale): deleting
     # now would make that decision silently.
     if [[ -n "$(manifest_get "${key}" .awaiting_decision.reason)" ]]; then
-      result_set "${key}" failed "not deleting: startup is waiting for an operator decision since $(manifest_get "${key}" .awaiting_decision.since) ($(manifest_get "${key}" .awaiting_decision.reason)) — run startup with HIBERNATE_SKIP_LOAD=true or HIBERNATE_FORCE_LOAD=true first"
+      result_set "${key}" failed "not deleting: startup is waiting for an operator decision since $(manifest_get "${key}" .awaiting_decision.since) ($(manifest_get "${key}" .awaiting_decision.reason)) — $(manifest_get "${key}" '.awaiting_decision.resolve // "run startup with HIBERNATE_SKIP_LOAD=true or HIBERNATE_FORCE_LOAD=true"') first"
       return 0
     fi
     # Never delete what cannot be brought back tomorrow: the restore image
@@ -181,7 +182,7 @@ snapshot_env() {
   local op_file="${OPT_WORK_DIR}/state/${key}.save-operation"
   rm -f "${op_file}"
   path="$(composer_snapshot_save "${name}" "${region}" "${project}" "${location}" "${op_file}")" || {
-    track_abandoned_save "${key}" "${op_file}"
+    track_abandoned_save "${key}" "${op_file}" || true
     result_set "${key}" failed "snapshot save failed; environment NOT deleted"
     return 0
   }
@@ -244,16 +245,6 @@ snapshot_env() {
 }
 
 # ── Phase 4 helpers ─────────────────────────────────────────────────────────
-# A save that was accepted but then abandoned (poll failures, timeout) keeps
-# running server-side; remember it so its folder is tracked and pruned.
-track_abandoned_save() {
-  local key="$1" op_file="$2" op
-  [[ -s "${op_file}" ]] || return 0
-  op="$(cat "${op_file}")"
-  manifest_update "${key}" '.pending_saves = ((.pending_saves // []) + [{operation: $op, at: $t}])' \
-    --arg op "${op}" --arg t "$(_ts)"
-  manifest_push "${key}" || true
-}
 
 # Resolves pending_saves: a finished save's folder joins the snapshot list
 # (untracked: unverified, never a restore point) so the next prune deletes it.
@@ -346,7 +337,9 @@ prune_snapshots() {
   latest="$(manifest_get "${key}" .latest_snapshot.path)"
   # Never prune the restore point, whatever its position in the list.
   # Incomplete (no database dump) and untracked (abandoned, unverified)
-  # folders take no retention slot: they always go.
+  # folders take no retention slot: they always go. The others are kept
+  # newest first by saved_at (not list position: safety snapshots taken by
+  # startup are appended at the end).
   while IFS= read -r path; do
     [[ -n "${path}" && "${path}" != "${latest}" ]] || continue
     info "[${key}] pruning snapshot ${path} (retention: ${keep})"
@@ -360,7 +353,8 @@ prune_snapshots() {
   done < <(jq -r --argjson keep "${keep}" --arg latest "${latest}" \
     '[.snapshots[]? | select(.path != $latest)]
      | ([.[] | select(.incomplete == true or .untracked == true)]
-        + ([.[] | select(.incomplete != true and .untracked != true)] | .[($keep - 1 | if . < 0 then 0 else . end):]))
+        + ([.[] | select(.incomplete != true and .untracked != true)] | sort_by(.saved_at // "") | reverse
+           | .[($keep - 1 | if . < 0 then 0 else . end):]))
      | .[].path' \
     "$(manifest_local_path "${key}")")
 }

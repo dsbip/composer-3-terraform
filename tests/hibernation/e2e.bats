@@ -978,3 +978,101 @@ keep_then_failed_destroy() {
   [ "$status" -eq 0 ]
   [ "$(env_state composer-dev)" = NOT_FOUND ]
 }
+
+
+# ── Verification of 40ec306 ──────────────────────────────────────────────────
+
+@test "a safety snapshot survives the next shutdown even when retention is full" {
+  # Fixture retention is 2: reach steady state first.
+  local i
+  for i in 1 2; do
+    shutdown_run --env composer-dev
+    [ "$status" -eq 0 ]
+    startup_run --env composer-dev
+    [ "$status" -eq 0 ]
+  done
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  manual_deploy
+  set_env_field composer-dev '._db = "weekend-work"'
+  startup_run --env composer-dev
+  [ "$status" -eq 0 ]
+  local safety
+  safety="$(manifest_field composer-dev '[.snapshots[] | select(.safety == true)][0].path')"
+  [ -f "$(gcs_path "${safety}")/airflow-database.sql.gz" ]
+  shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  # The newest non-restore-point snapshot is kept by age, not list position.
+  [ -f "$(gcs_path "${safety}")/airflow-database.sql.gz" ]
+  [ "$(cat "$(gcs_path "${safety}")/airflow-database.sql.gz")" = weekend-work ]
+}
+
+@test "recovery variables are refused on scheduled pipelines and without an environment selection" {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  CI_PIPELINE_SOURCE=schedule HIBERNATE_SKIP_LOAD=true startup_run --env composer-dev
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"must not be set for scheduled pipelines"* ]]
+  HIBERNATE_SKIP_LOAD=true startup_run
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"need HIBERNATE_ENVIRONMENTS"* ]]
+  [ "$(env_state composer-dev)" = NOT_FOUND ]
+  # The real schedule still works.
+  CI_PIPELINE_SOURCE=schedule startup_run --env composer-dev
+  [ "$status" -eq 0 ]
+  [ "$(env_field composer-dev ._db)" = airflow-db-of-composer-dev ]
+  [ "$(manifest_field composer-dev '.history[0] | has("options")')" = false ]
+}
+
+@test "a pending decision is dropped once its environment is replaced by another one" {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  manual_deploy
+  set_env_field composer-dev "._db = \"weeks-of-work\" | .createTime = \"$(long_ago)\""
+  startup_run --env composer-dev
+  [ "$status" -eq 1 ]
+  [ -n "$(manifest_field composer-dev '.awaiting_decision.environment_uuid // empty')" ]
+  # Someone deletes it by hand and deploys again: a different, new environment.
+  set_env_field composer-dev "._db = \"\" | .uuid = \"replaced-env\" | .createTime = \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+  startup_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"dropping the pending decision"* ]]
+  [ "$(manifest_field composer-dev '.awaiting_decision // "none"')" = none ]
+  [ "$(env_field composer-dev ._db)" = airflow-db-of-composer-dev ]
+}
+
+@test "an ERROR environment the snapshot had been loaded into is not replaced without --force-load" {
+  shutdown_run --env composer-dev
+  [ "$status" -eq 0 ]
+  startup_run --env composer-dev
+  [ "$status" -eq 0 ]
+  # The final ACTIVE write "failed", users worked, then the environment broke.
+  set_manifest_field composer-dev '.status = "RESTORING"'
+  set_env_field composer-dev '.state = "ERROR" | ._db = "work-of-today"'
+  local applies
+  applies="$(tf_apply_count)"
+  startup_run --env composer-dev
+  show_output
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"after the snapshot had been loaded into it"* ]]
+  [ "$(tf_apply_count)" = "${applies}" ]
+  [ "$(env_field composer-dev ._db)" = work-of-today ]
+  shutdown_run --env composer-dev
+  [ "$status" -eq 1 ]
+  [ "$(env_state composer-dev)" = ERROR ]
+  # Not even a forced delete may pre-empt the pending decision.
+  HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT=true shutdown_run --env composer-dev
+  show_output
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"waiting for an operator decision"*"fix the environment, or run startup with HIBERNATE_FORCE_LOAD=true"* ]]
+  [ "$(env_state composer-dev)" = ERROR ]
+
+  HIBERNATE_FORCE_LOAD=true startup_run --env composer-dev
+  show_output
+  [ "$status" -eq 0 ]
+  [ "$(env_state composer-dev)" = RUNNING ]
+  [ "$(env_field composer-dev ._db)" = airflow-db-of-composer-dev ]
+  [ "$(manifest_field composer-dev '.history[0].options | join(",")')" = force-load ]
+}

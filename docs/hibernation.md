@@ -174,7 +174,9 @@ over an environment that has existed for longer than
 `HIBERNATE_FRESH_ENV_HOURS` (default 96 h) while the state file says it is
 hibernated — that one may hold real work (see the state file below). Before
 loading over an environment that was found running, a safety snapshot of it is
-taken (best effort), so the overwrite can be undone. When the outcome of an
+taken, so the overwrite can be undone: it is retained by age like any other
+snapshot (`snapshot_retention_count`). A safety save that is rejected only
+warns; one still running after the wait stops the load (re-run startup). When the outcome of an
 earlier load cannot be read (Composer API error), neither script guesses: the
 run fails for that environment and can be re-run.
 
@@ -195,19 +197,24 @@ Each environment has `<snapshot_location>/hibernation-state.json`:
 | `SNAPSHOT_SAVED` | Snapshot taken; deletion not (yet) confirmed. | Recreate + load. | The environment the restore point was taken of (same uuid): it was never deleted → `ACTIVE`, nothing loaded. Any other environment (re-created, or never restored — e.g. after a "keep"): like `HIBERNATED`. |
 | `HIBERNATED` | Environment deleted; `latest_snapshot` is the restore point. | Recreate + load. | Re-created outside the cycle (e.g. `dev-apply` at night): load into it if it is younger than `HIBERNATE_FRESH_ENV_HOURS`; otherwise refused — `--skip-load` keeps it as it is, `--force-load` loads. |
 | `RESTORING` | A startup is in progress or was interrupted. | Recreate + load. | Load — unless the recorded load into this environment already finished (then only `ACTIVE` is written); same age rule as above. |
+| `ACTIVE` | Running with the snapshot restored (or created empty). | Deleted outside the cycle: recreated from the last snapshot (the log names its date). | Nothing. |
 
 An environment in `ERROR` (it cannot be snapshotted) is replaced + loaded when
 that loses nothing: the snapshot is of that very environment (`SNAPSHOT_SAVED`,
 same uuid), or the environment is younger than `HIBERNATE_FRESH_ENV_HOURS`
-(e.g. startup itself created it into `ERROR`). An older one is refused;
-`--force-load` replaces it, `--skip-load` does not.
+and never received the snapshot (e.g. startup itself created it into `ERROR`).
+An older one, or one the snapshot had already been loaded into (it may hold
+work done since), is refused; `--force-load` replaces it. `--skip-load` never
+replaces a refused one (a young one is replaced by an empty environment).
 
 When startup refuses to decide (`would overwrite` / `would destroy`), it
-records `awaiting_decision` in the state file and every shutdown of that
-environment fails (leaving it running) until a startup with `--skip-load` or
-`--force-load` resolves it — otherwise the evening shutdown would silently make
-the decision.
-| `ACTIVE` | Running with the snapshot restored (or created empty). | Deleted outside the cycle: recreated from the last snapshot (the log names its date). | Nothing. |
+records `awaiting_decision` (with that environment's uuid) in the state file,
+and every shutdown of that environment fails (leaving it running) until it is
+resolved — otherwise the evening shutdown would silently make the decision. A
+running environment is resolved by a startup with `HIBERNATE_SKIP_LOAD` or
+`HIBERNATE_FORCE_LOAD`; an `ERROR` one by fixing it or `HIBERNATE_FORCE_LOAD`.
+The decision is dropped automatically once that environment is gone or
+replaced by another one.
 
 A shutdown normally makes its new snapshot the restore point. It keeps the old
 one (and stores the new snapshot as secondary, `restore_incomplete: true`) when
@@ -349,8 +356,9 @@ pipeline source).
 * `HIBERNATE_ACTION=dry-run` — read-only rehearsal (plans, no changes);
 * no variable — the normal pipeline plus manual buttons for all three.
 
-Recovery options are passed as variables on such a run, together with
-`HIBERNATE_ENVIRONMENTS=<key>` so they only touch that environment:
+Recovery options are passed as variables on such a one-off run, together with
+`HIBERNATE_ENVIRONMENTS=<key>` (required) so they only touch that environment
+— never as schedule, project or group variables (refused on schedules):
 `HIBERNATE_SKIP_LOAD`, `HIBERNATE_FORCE_LOAD`, `HIBERNATE_ALLOW_INITIAL_CREATE`
 (startup) and `HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT` (shutdown). Prefer this
 to running the scripts locally: a local run needs the CI identity's
@@ -385,7 +393,9 @@ scripts/hibernation/composer-shutdown.sh --config configs/development.yaml
 scripts/hibernation/composer-startup.sh  --config configs/development.yaml --env composer-dev
 ```
 
-Command-line options replace the corresponding environment variables.
+Command-line options replace the corresponding environment variables
+(`--skip-load` / `--force-load` replace both load variables; the other boolean
+recovery variables cannot be switched off from the command line).
 
 | Option | |
 |---|---|
@@ -397,13 +407,13 @@ Command-line options replace the corresponding environment variables.
 | `--work-dir DIR` | Where logs/plans/summary go (or `HIBERNATE_WORK_DIR`). Must be new or empty for every run; default `$TF_ROOT/.hibernation/<mode>-<timestamp>-<pid>`. |
 | `--force-delete-without-snapshot` | shutdown: delete `ERROR` environments (restore uses the previous snapshot). Or `HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT=true`. |
 | `--allow-initial-create` | startup: allow creating an environment without its hibernation state file (first deployment, or knowingly starting empty). Or `HIBERNATE_ALLOW_INITIAL_CREATE=true`. |
-| `--skip-load` | startup: load nothing — recreated environments start empty, running ones are kept as they are; the next shutdown's snapshot becomes the restore point. Never replaces an `ERROR` environment. Or `HIBERNATE_SKIP_LOAD=true`. |
+| `--skip-load` | startup: load nothing — recreated environments start empty, running ones are kept as they are; the next shutdown's snapshot becomes the restore point. Never replaces an `ERROR` environment that startup refuses to replace (a young one is replaced by an empty environment). Or `HIBERNATE_SKIP_LOAD=true`. |
 | `--force-load` | startup: load the snapshot even into an environment that has existed for longer than `HIBERNATE_FRESH_ENV_HOURS`, or replace such an environment in `ERROR` (overwrites its Airflow database). Or `HIBERNATE_FORCE_LOAD=true`. |
 
 | Environment variable | Default | |
 |---|---|---|
 | `HIBERNATE_CONFIG_FILE`, `HIBERNATE_ENVIRONMENTS`, `HIBERNATE_DRY_RUN`, `HIBERNATE_SKIP_INIT`, `HIBERNATE_TF_VAR_FILES`, `HIBERNATE_WORK_DIR` | — | Same as the options above (`HIBERNATE_ENVIRONMENTS` set but naming no environment is refused). |
-| `HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT` (shutdown), `HIBERNATE_ALLOW_INITIAL_CREATE`, `HIBERNATE_SKIP_LOAD`, `HIBERNATE_FORCE_LOAD` (startup) | `false` | The recovery options above, settable on a manual GitLab run (each only affects its own script). |
+| `HIBERNATE_FORCE_DELETE_WITHOUT_SNAPSHOT` (shutdown), `HIBERNATE_ALLOW_INITIAL_CREATE`, `HIBERNATE_SKIP_LOAD`, `HIBERNATE_FORCE_LOAD` (startup) | `false` | The recovery options above, for a one-off manual GitLab run (each only affects its own script). Refused on scheduled pipelines and without `HIBERNATE_ENVIRONMENTS` / `--env`, so one left behind in a schedule or in the CI/CD variables cannot act on every night or every environment. Active options are logged and recorded in the state file history. |
 | `TF_ROOT` | repository root | Terraform root module. |
 | `TF_MODULE_ADDRESS` | `module.composer` | Address of the module call (if you wrap this module differently). |
 | `TF_BACKEND_BUCKET` / `TF_BACKEND_PREFIX` | — | GCS backend; a git-ignored `backend_override.tf` is generated when the root declares no backend, and init is verified to have selected `gcs`. |
@@ -452,7 +462,7 @@ Requirements: bash 4.3+, terraform ≥ 1.6, gcloud, jq, curl, coreutils.
   `HIBERNATE_SKIP_LOAD` / `HIBERNATE_FORCE_LOAD`), and shutdown makes its
   snapshot the restore point — unless a startup already refused, then the
   shutdown waits for that decision. A younger environment is loaded over, but a
-  safety snapshot of it is kept first.
+  safety snapshot of it is kept first (retained like any other snapshot).
 * **Snapshot limits:** Airflow database < 20 GB, < 100,000 objects in
   `dags/`+`plugins/`+`data/`. Use `data_retention` to keep the database small.
 * **Outputs while hibernated:** `terraform output` keeps stale values for a
@@ -480,9 +490,11 @@ Requirements: bash 4.3+, terraform ≥ 1.6, gcloud, jq, curl, coreutils.
 | startup: `only load into the same or a later Airflow version` | The recreated environment runs an older Airflow version than the snapshot (state stays `RESTORING`). Startup does not change a running environment's image, so a re-run alone does not help: set a compatible `image_version`, apply it with the normal deploy (in-place upgrade) or delete the environment, then re-run startup. |
 | `… the Terraform state but the YAML resolves to …` / `disagree on which environment` | The state holds a different environment than the YAML names: apply the pending rename/move first, fix a duplicated `environment_name`, or check the backend. |
 | `… is also defined by: …` | Two YAML keys resolve to the same project/region/name. |
-| `would overwrite its Airflow database` (startup) | The environment has existed for a long time (or its age is unknown) although the state file says hibernated. Run startup with `HIBERNATE_SKIP_LOAD=true` to keep it (`ACTIVE`) or `HIBERNATE_FORCE_LOAD=true` to load the snapshot over it. Shutdowns of it fail until then. |
-| `is in ERROR … cannot be snapshotted, so replacing it would destroy its Airflow database` | Same, for an `ERROR` environment: fix it, or `HIBERNATE_FORCE_LOAD=true` to replace it with the snapshot. |
-| `waiting for an operator decision` (shutdown) | A startup refused to overwrite this environment; resolve it as above. |
+| `would overwrite its Airflow database` (startup) | The environment has existed for a long time (or its age is unknown) although the state file says hibernated. Run startup with `HIBERNATE_SKIP_LOAD=true` to keep it (`ACTIVE`) or `HIBERNATE_FORCE_LOAD=true` to load the snapshot over it — on a one-off *Run pipeline* with `HIBERNATE_ENVIRONMENTS=<key>`. Shutdowns of it fail until then. |
+| `is in ERROR … cannot be snapshotted, so replacing it would destroy its Airflow database` | Same, for an `ERROR` environment (long-lived, or the snapshot had already been loaded into it): fix it, or `HIBERNATE_FORCE_LOAD=true` to replace it with the snapshot. |
+| `waiting for an operator decision` (shutdown) | A startup refused to overwrite this environment; the message says how to resolve it (as above). |
+| `recovery variable(s) … must not be set for scheduled pipelines` / `… need HIBERNATE_ENVIRONMENTS` | Remove the variable from the schedule / CI/CD variables; pass it only on a one-off run together with `HIBERNATE_ENVIRONMENTS`. |
+| `the safety snapshot of the running environment is still in progress` | The Composer API did not report the safety snapshot finishing in time; nothing was loaded. Re-run startup. |
 | `could not check whether the … snapshot load completed` | The Composer API failed while reading the earlier load operation; nothing was changed. Re-run. |
 | `no hibernation state file at …` (startup) | The state file is not where the settings point (`snapshot_bucket`/`snapshot_prefix` changed?). Move the old folder there, or `--allow-initial-create` to start empty. |
 | `already holds the files of an earlier run` | Use a new, empty `--work-dir` / `HIBERNATE_WORK_DIR` per run. |

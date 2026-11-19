@@ -95,11 +95,12 @@ preflight() {
   # For an existing environment: is it the one the restore point came from,
   # how long has it existed, and did an earlier load into it already finish?
   local recreated=false fresh=true done=false frc
+  clear_stale_decision "${key}" "${state}"
   if [[ "${state}" == RUNNING || "${state}" == ERROR ]]; then
     env_recreated_since_snapshot "${key}" && recreated=true
     env_is_fresh "${key}" && frc=0 || frc=$?
     ((frc == 0)) || fresh=false # unknown age: fail closed
-    if [[ "${state}" == RUNNING && "${status}" == RESTORING && "${has_snapshot}" == true ]]; then
+    if [[ "${status}" == RESTORING && "${has_snapshot}" == true ]]; then
       case "$(restore_attempt_state "${key}")" in
       SUCCEEDED) done=true ;;
       UNKNOWN)
@@ -115,6 +116,9 @@ preflight() {
   if [[ "${OPT_FORCE_LOAD}" == true ]] || [[ "${OPT_SKIP_LOAD}" == true && "${state}" == RUNNING ]]; then
     fresh=true
   fi
+  # --force-load also replaces an ERROR environment the snapshot had already
+  # been loaded into (refused by default: it may hold work done since).
+  [[ "${OPT_FORCE_LOAD}" == true && "${state}" == ERROR ]] && done=false
   action="$(decide_startup_action "${state}" "${status:-NONE}" "${has_snapshot}" "${recreated}" "${fresh}" "${done}")"
   if [[ "${OPT_SKIP_LOAD}" == true ]]; then
     case "${action}" in
@@ -181,18 +185,27 @@ preflight() {
     return 0
     ;;
   refuse_stale)
-    local since why
+    local since why resolve how="on a one-off 'Run pipeline' with HIBERNATE_ENVIRONMENTS=${key}"
     since="$(describe_get "${key}" .createTime)"
     [[ -n "${since}" ]] || since="an unknown time"
     if [[ "${state}" == ERROR ]]; then
-      why="environment is in ERROR and has existed since ${since} (over ${HIBERNATE_FRESH_ENV_HOURS}h, or age unknown) although the state file says ${status}; it cannot be snapshotted, so replacing it would destroy its Airflow database — fix it, or re-run startup with HIBERNATE_FORCE_LOAD=true (--force-load) to replace it with ${snapshot}"
+      resolve="fix the environment, or run startup with HIBERNATE_FORCE_LOAD=true / --force-load (${how}) to replace it with the snapshot"
+      if [[ "${status}" == RESTORING && "${done}" == true ]]; then
+        why="environment is in ERROR after the snapshot had been loaded into it (it may hold work done since); it cannot be snapshotted, so replacing it would destroy its Airflow database — ${resolve}"
+      else
+        why="environment is in ERROR and has existed since ${since} (over ${HIBERNATE_FRESH_ENV_HOURS}h, or age unknown) although the state file says ${status}; it cannot be snapshotted, so replacing it would destroy its Airflow database — ${resolve}"
+      fi
     else
-      why="environment has existed since ${since} (over ${HIBERNATE_FRESH_ENV_HOURS}h, or age unknown) although the state file says ${status}; loading ${snapshot} would overwrite its Airflow database — re-run startup with HIBERNATE_SKIP_LOAD=true (--skip-load) to keep it as it is, or HIBERNATE_FORCE_LOAD=true (--force-load) to replace it with the snapshot"
+      resolve="run startup with HIBERNATE_SKIP_LOAD=true / --skip-load to keep it as it is, or HIBERNATE_FORCE_LOAD=true / --force-load to replace it with the snapshot (${how})"
+      why="environment has existed since ${since} (over ${HIBERNATE_FRESH_ENV_HOURS}h, or age unknown) although the state file says ${status}; loading ${snapshot} would overwrite its Airflow database — ${resolve}"
     fi
-    # Until someone decides, shutdowns must not decide for them.
+    # Until someone decides, shutdowns of THIS environment must not decide
+    # for them (cleared on ACTIVE, or when the environment is gone/replaced).
     if [[ "${OPT_DRY_RUN}" != true ]]; then
-      manifest_update "${key}" '.awaiting_decision = (.awaiting_decision // {reason: $r, since: $t})' \
-        --arg r "startup refused to overwrite an environment that existed since ${since}" --arg t "$(_ts)"
+      manifest_update "${key}" '.awaiting_decision = (if .awaiting_decision.environment_uuid == $u then .awaiting_decision
+          else {reason: $r, since: $t, environment_uuid: $u, resolve: $x} end)' \
+        --arg r "startup refused to overwrite the environment created ${since}" --arg t "$(_ts)" \
+        --arg u "$(describe_get "${key}" .uuid)" --arg x "${resolve}"
       manifest_push "${key}" || true
     fi
     result_set "${key}" failed "${why}"
@@ -212,16 +225,24 @@ preflight() {
 
 # ── Phase 3: load snapshots (parallel, one sub-shell per environment) ───────
 # safety_snapshot KEY — snapshot of a running environment before a load
-# overwrites it, recorded as a "safety" entry (never a restore point; pruned
-# by retention like any other). Failure only warns: the restore goes ahead.
+# overwrites it, recorded as a "safety" entry (never a restore point; kept by
+# retention by age like any other snapshot). A rejected save only warns (the
+# restore goes ahead); a save still running after the wait returns 1.
 safety_snapshot() {
   local key="$1" name region project location path
   name="$(setting "${key}" .environment_name)"
   region="$(setting "${key}" .region)"
   project="$(setting "${key}" .project_id)"
   location="$(setting "${key}" .hibernation.snapshot_location)"
+  local op_file="${OPT_WORK_DIR}/state/${key}.safety-operation"
+  rm -f "${op_file}"
   info "[${key}] saving a safety snapshot of the running environment before loading over it"
-  if ! path="$(composer_snapshot_save "${name}" "${region}" "${project}" "${location}")"; then
+  if ! path="$(composer_snapshot_save "${name}" "${region}" "${project}" "${location}" "${op_file}")"; then
+    # Accepted but abandoned: it still runs server-side (tracked for the next
+    # prune), and a load now would collide with it.
+    if track_abandoned_save "${key}" "${op_file}"; then
+      return 1
+    fi
     warn "[${key}] could not save a safety snapshot; loading anyway"
     return 0
   fi
@@ -318,8 +339,9 @@ restore_env() {
   *)
     # Loading over an environment that was already running: keep what is
     # there first (best effort), so the overwrite can be undone.
-    if [[ "${action}" == load ]]; then
-      safety_snapshot "${key}"
+    if [[ "${action}" == load ]] && ! safety_snapshot "${key}"; then
+      result_set "${key}" failed "the safety snapshot of the running environment is still in progress; nothing loaded — re-run startup"
+      return 0
     fi
     ;;
   esac
